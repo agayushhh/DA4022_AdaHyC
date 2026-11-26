@@ -1,0 +1,69 @@
+{
+ "model": "meta-llama/Llama-2-7b-hf",
+ "B": 4,
+ "S": 512,
+ "rows": [
+  {
+   "variant": "baseline (bf16, no compression)",
+   "config": {
+    "layer_type": "baseline"
+   },
+   "held_mib": 11745.0,
+   "formula_avg_bits": 16.0,
+   "pct_of_bf16": 100.0
+  },
+  {
+   "variant": "intra_inter released q2",
+   "config": {
+    "layer_type": "intra_inter",
+    "q_bit": 2
+   },
+   "held_mib": 1426.25,
+   "formula_avg_bits": 2.0116822429906542,
+   "pct_of_bf16": 12.143465304384845
+  },
+  {
+   "variant": "intra_inter hyc_fixes q2",
+   "config": {
+    "layer_type": "intra_inter",
+    "q_bit": 2,
+    "hyc_fixes": true
+   },
+   "held_mib": 1426.875,
+   "formula_avg_bits": 2.0116822429906542,
+   "pct_of_bf16": 12.148786717752236
+  },
+  {
+   "variant": "intra_inter hyc_fixes q4",
+   "config": {
+    "layer_type": "intra_inter",
+    "q_bit": 4,
+    "hyc_fixes": true
+   },
+   "held_mib": 2275.99951171875,
+   "formula_avg_bits": 4.011682242990654,
+   "pct_of_bf16": 19.37845476133461
+  },
+  {
+   "variant": "adahyc q2 tau0.1",
+   "config": {
+    "layer_type": "adahyc",
+    "q_bit": 2
+   },
+   "held_mib": 1259.5,
+   "formula_avg_bits": 1.6366822429906542,
+   "pct_of_bf16": 10.723712217965092
+  },
+  {
+   "variant": "adahyc q2 plan plan.json",
+   "config": {
+    "layer_type": "adahyc",
+    "q_bit": 2,
+    "bit_plan_path": "../../probe/out_llama2_7b/plan.json"
+   },
+   "held_mib": 1419.578125,
+   "formula_avg_bits": 2.0106965537383177,
+   "pct_of_bf16": 12.086659216687952
+  }
+ ]
+}

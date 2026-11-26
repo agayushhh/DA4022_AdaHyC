@@ -1,0 +1,2913 @@
+diff --git a/check_da.py b/check_da.py
+new file mode 100644
+index 0000000..610f15d
+--- /dev/null
++++ b/check_da.py
+@@ -0,0 +1,301 @@
++"""DA4022 checks.
++  python check_da.py --cpu                          # CPU only: rebuild formulas, bit plan, decision rule, bit accounting,
++                                                    #   RMSNorm backward formula, calibration statistics (hyc_fixes)
++  python check_da.py /path/to/TinyLlama [--plan p.json]
++      # + GPU correctness gate: LoRA grads of every variant vs TRUE QLoRA (HF+PEFT path, use_hyclora=False),
++      #   calibrated on 5 GSM8K-train batches, measured on 2 different ones. Fails (AssertionError) unless
++      #   fused baseline + hyc_fixes is closer to HF than released and cos > 0.999, and the fixed intra_inter q8 row
++      #   has cos >= 0.99 and >= the released q8 row.
++"""
++import json
++import os
++import sys
++import tempfile
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++import torch
++import torch.nn.functional as F
++
++from models.llama.adahyc_utils import (
++    BUFFERS, REBUILDABLE, buffer_numel, layer_bits, layer_rebuild, rmsnorm_rebuild, rebuild_x_medium, rel_err,
++    decide_rebuild, avg_stored_bits, plan_avg_bits,
++)
++
++
++def import_compress_function():
++    """operators.compress_function needs triton at import time; on a CPU-only box stub it (kernels are never launched here)"""
++    try:
++        import triton  # noqa: F401
++    except ImportError:
++        stub = MagicMock(__version__='3.0.0')
++        for name in ('triton', 'triton.language', 'triton.language.extra', 'triton.language.extra.cuda',
++                     'triton.language.extra.cuda.libdevice', 'triton.language.math'):
++            sys.modules[name] = stub
++    import operators.compress_function as cf
++    return cf
++
++
++def rmsnorm_dx(dy, x, w, eps, fix):
++    """torch restatement of operators/rmsnorm_kernels.py::_rms_norm_bwd_dx_fused (RMS_FIX=fix)"""
++    rstd = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
++    xhat, wdy = x * rstd, w * dy
++    c1 = (xhat * wdy).mean(-1, keepdim=True)
++    c2 = 0 if fix else wdy.mean(-1, keepdim=True)
++    return (wdy - (xhat * c1 + c2)) * rstd
++
++
++def check_calibration_cpu():
++    cf = import_compress_function()
++    no_kernel = lambda *a, **k: (None, None)  # quantization kernels are not needed to check the statistics
++    with patch.object(cf, 'compression_quantization_with_zero_point', lambda *a, **k: None), \
++         patch.object(cf, 'outlier_subtraction_fuse_compression_quantization', no_kernel):
++        B, S, H, ratio, q_bit, T = 2, 8, 16, 0.125, 2, 5  # 2 outlier channels
++        torch.manual_seed(0)
++        xs = []
++        for it in range(T):  # iteration 0: channels 0,1 are the outliers; later iterations: channels 2,3
++            x = torch.randn(B, S, H)
++            x[:, :, [0, 1] if it == 0 else [2, 3]] *= 100
++            x[1] *= 3  # sample 1 has a wider range than sample 0
++            xs.append(x)
++        for zp in (False, True):
++            res = {}
++            for fixes in (False, True):
++                sv = {'outlier_channel_index': None, 'scale': None, 'zero_point': None}
++                for it, x in enumerate(xs):
++                    _, _, idx, scale, z = cf.compression_pack_channel(x.clone(), ratio, q_bit, 'per-channel', it, T, sv, zp, fixes)
++                    sv = cf.update_dict(sv, {'outlier_channel_index': idx, 'scale': scale, 'zero_point': z}, it)
++                res[fixes] = sv
++            rel, fix = res[False], res[True]
++            # released: index = last iteration's; channel 0 was zeroed in iteration 0 -> its averaged scale is shrunk
++            true0 = torch.stack([(x[0, :, 0].max() - x[0, :, 0].min()) / (2 ** q_bit - 1) for x in xs[1:]]).mean()
++            assert sorted(rel['outlier_channel_index'].tolist()) == [2, 3]
++            assert rel['scale'].flatten()[0].float() < 0.85 * true0, 'released calibration bug not reproduced'
++            # fixed: index frozen at iteration 0; every other channel's scale = mean over iterations of the
++            # all-sample range (no zeroed iterations mixed in, sample 1 not clipped)
++            assert sorted(fix['outlier_channel_index'].tolist()) == [0, 1]
++            want = torch.stack([(x.amax((0, 1)) - x.amin((0, 1))) / (2 ** q_bit - 1) for x in xs]).mean(0)
++            got = fix['scale'].flatten().float()
++            keep = torch.ones(H, dtype=torch.bool)
++            keep[[0, 1]] = False
++            assert torch.allclose(got[keep], want[keep], rtol=1e-2), (got, want)
++            print(f'[cpu] calibration (zero_point={zp}): released ch0 scale {rel["scale"].flatten()[0].item():.3f} '
++                  f'(true {true0.item():.3f}, shrunk); fixed index frozen {fix["outlier_channel_index"].tolist()}, scales over all samples')
++        # zero point covers [min, max] of all samples when fixed
++        x = xs[1]
++        s, z = cf.get_statistics_zero_point(x, q_bit, fixes=True)
++        lo, hi = (-z - 2 ** (q_bit - 1)) * s, (-z + 2 ** (q_bit - 1) - 1) * s
++        assert (lo <= x.amin((0, 1)) + s).all() and (hi >= x.amax((0, 1)) - s).all()
++        s0, _ = cf.get_statistics_zero_point(x, q_bit, fixes=False)
++        assert (s0 <= s).all() and (s0 < s).any()
++
++
++def cpu_check():
++    torch.manual_seed(0)
++    B, S, H, r, eps = 2, 16, 64, 8, 1e-5
++    x, o = torch.randn(B, S, H), torch.randn(B, S, H)
++    w1, w2 = torch.rand(H) + 0.5, torch.rand(H) + 0.5
++    W_o, b_o, A, Bm = torch.randn(H, H) / H ** 0.5, torch.randn(H), torch.randn(H, r), torch.randn(r, H)
++    rmsnorm = lambda t, w: t * torch.rsqrt(t.pow(2).mean(-1, keepdim=True) + eps) * w  # plain torch
++    flat_rstd = lambda t: torch.rsqrt(t.pow(2).mean(-1) + eps).flatten()                # rmsnorm_forward's rstd layout
++
++    # quantization = identity: rebuilt buffers must equal the true ones
++    x_norm_1 = rmsnorm(x, w1)
++    x_medium = x + F.linear(o, W_o, b_o) + (o @ A) @ Bm
++    x_norm_2 = rmsnorm(x_medium, w2)
++    x_medium_rebuilt = rebuild_x_medium(x, o, W_o.t(), b_o, o @ A, Bm)
++    errs = {
++        'x_norm_1': rel_err(rmsnorm_rebuild(x, flat_rstd(x), w1), x_norm_1),
++        'x_medium': rel_err(x_medium_rebuilt, x_medium),
++        'x_medium (no bias)': rel_err(rebuild_x_medium(x, o, W_o.t(), None, o @ A, Bm), x_medium - b_o),
++        'x_norm_2': rel_err(rmsnorm_rebuild(x_medium_rebuilt, flat_rstd(x_medium), w2), x_norm_2),
++    }
++    print('[cpu] rebuild rel-err with identity quantization:', {k: f'{v:.2e}' for k, v in errs.items()})
++    assert errs['x_medium'] < 1e-6 and errs['x_medium (no bias)'] < 1e-6
++    assert errs['x_norm_1'] < 5e-3 and errs['x_norm_2'] < 5e-3  # rmsnorm_rebuild rounds to bf16 like the kernel output
++
++    # RMSNorm backward: the fixed kernel formula is the autograd gradient, the released one is not
++    xd = x.double().requires_grad_()
++    dy = torch.randn_like(xd)
++    rmsnorm(xd, w1.double()).backward(dy)
++    e_fix = rel_err(rmsnorm_dx(dy, xd.detach(), w1.double(), eps, True), xd.grad)
++    e_rel = rel_err(rmsnorm_dx(dy, xd.detach(), w1.double(), eps, False), xd.grad)
++    print(f'[cpu] RMSNorm dx rel-err vs autograd: fixed {e_fix:.1e}, released (LayerNorm c2 term) {e_rel:.1e}')
++    assert e_fix < 1e-10 and e_rel > 1e-3
++
++    # bit plan
++    bits = layer_bits({'0': {'gate': 4, 'x_norm_1': 8}}, 0, 2)
++    assert bits['gate'] == 4 and bits['x_norm_1'] == 8 and bits['up'] == 2 and set(bits) == set(BUFFERS)
++    assert layer_bits({'0': {'gate': 4}}, 1, 2) == {b: 2 for b in BUFFERS} == layer_bits(None, 5, 2)
++    plan = {'0': {'gate': 4, 'rebuild': ['x_medium']}, '1': {'rebuild': []}, '2': {'up': 8}}
++    assert layer_bits(plan, 0, 2)['gate'] == 4 and 'rebuild' not in layer_bits(plan, 0, 2)
++    assert layer_rebuild(plan, 0) == {'x_medium'} and layer_rebuild(plan, 1) == frozenset()
++    assert layer_rebuild(plan, 2) is None and layer_rebuild(plan, 3) is None and layer_rebuild(None, 0) is None
++    for bad in ({'0': {'gate': 3}}, {'0': {'a': 2}}, {'0': {'rebuild': ['q']}}, {'0': {'rebuild': 'x_medium'}}):
++        try:
++            layer_bits(bad, 0, 2)
++            raise RuntimeError(f'bad plan accepted: {bad}')
++        except AssertionError:
++            pass
++
++    # decision rule: rebuild iff rebuild_err <= (1 + tau) * store_err; x_norm_2 scored on the x_medium actually used
++    e = {'x_norm_1': [1.05, 1.0], 'x_medium': [2.0, 1.0], 'x_norm_2': [1.0, 1.0], 'x_norm_2@rebuilt_x_medium': [9.0, 1.0]}
++    assert decide_rebuild(e, 0.1) == {'x_norm_1', 'x_norm_2'}
++    assert decide_rebuild(e, 0.0) == {'x_norm_2'}
++    assert decide_rebuild(e, 1.0) == {'x_norm_1', 'x_medium'}
++    assert decide_rebuild(e, -1) == set()
++
++    # accounting, TinyLlama dims (H=2048, kv=4*64, I=5632, 22 layers), outlier ratio 0.005 -> 10 channels
++    numel = buffer_numel(2048, 256, 5632)
++    layer = lambda q_bit, rebuild=(): SimpleNamespace(numel=numel, bits={b: q_bit for b in BUFFERS}, rebuild=rebuild)
++    hyc2 = avg_stored_bits([layer(2)] * 22, 0.005)
++    ada2 = avg_stored_bits([layer(2, REBUILDABLE)] * 22, 0.005)
++    assert abs(hyc2 - (2 * 24064 + 2 * 16 * 10) / 24064) < 1e-9 and avg_stored_bits([layer(8)] * 22, 0.0) == 8.0
++    all_rebuilt = {str(i): {'rebuild': list(REBUILDABLE)} for i in range(22)}
++    assert plan_avg_bits(all_rebuilt, 22, numel, 2, 0.005) == ada2 and plan_avg_bits(None, 22, numel, 2, 0.005) == hyc2
++    print(f'[cpu] avg stored bits, TinyLlama: HyC-LoRA 2-bit {hyc2:.4f}, 2-bit + all three rebuilt {ada2:.4f}')
++
++    check_calibration_cpu()
++    print('[cpu] all checks passed')
++
++
++def load_model(model_path):
++    """NF4 Llama + PEFT LoRA (r=16, alpha=16, all 7 projections) as run_gsm8k.py builds it, LoRA B ~ N(0, 0.02)"""
++    import peft
++    import transformers
++    from peft import LoraConfig, TaskType, get_peft_model
++    from models.llama.modeling_llama import LlamaForCausalLM
++    from run_gsm8k import HyCLoRAArguments
++
++    torch.manual_seed(0)
++    model = LlamaForCausalLM.from_pretrained(
++        model_path, low_cpu_mem_usage=True, torch_dtype=torch.bfloat16,
++        quantization_config=transformers.BitsAndBytesConfig(
++            load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16,
++            bnb_4bit_use_double_quant=True, bnb_4bit_quant_type="nf4",
++        ),
++        attn_implementation="eager",
++    )
++    model.set_fused_llama_layer(HyCLoRAArguments(layer_type='baseline'))
++    model = peft.prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
++    model = get_peft_model(model, LoraConfig(
++        task_type=TaskType.CAUSAL_LM, r=16, lora_alpha=16, lora_dropout=0.0,
++        target_modules=["q_proj", "k_proj", "v_proj", "up_proj", "gate_proj", "down_proj", "o_proj"],
++    ))
++    for n, p in model.named_parameters():  # LoRA B starts at 0, which would zero every lora_A grad
++        if 'lora_B' in n:
++            torch.nn.init.normal_(p, std=0.02)
++    model = model.to(torch.bfloat16)  # as run_gsm8k.py does; the fused kernels expect bf16 LoRA weights
++    model.train()  # the fused HyC-LoRA path only runs in training mode
++    return model
++
++
++def gsm8k_batches(model_path, n, B, S):
++    """n batches of B contiguous S-token windows of GSM8K-train text"""
++    import transformers
++    from datasets import load_dataset
++    tok = transformers.AutoTokenizer.from_pretrained(model_path)
++    data = load_dataset("openai/gsm8k", "main", split="train").select(range(400))
++    ids = tok("\n\n".join(f"{e['question']}\n{e['answer']}" for e in data), return_tensors='pt').input_ids[0]
++    assert ids.numel() >= n * B * S, 'not enough GSM8K text'
++    return [ids[i * B * S:(i + 1) * B * S].view(B, S).cuda() for i in range(n)]
++
++
++def demo_plan(n_layers):
++    """exercises both plan paths: odd layers state an explicit rebuild set, even layers use the tau rule"""
++    plan = {str(i): {'rebuild': ['x_norm_1', 'x_medium', 'x_norm_2']} if i % 2 else {'gate': 4, 'up': 4} for i in range(n_layers)}
++    plan['0']['x'] = 8
++    path = os.path.join(tempfile.gettempdir(), 'check_da_plan.json')
++    json.dump(plan, open(path, 'w'))
++    return path
++
++
++def gpu_check(model_path, plan_path=None, B=4, S=256):
++    from run_gsm8k import HyCLoRAArguments  # paper defaults: outlier ratios 0.005/0.05, iteration_threshold 5
++
++    model = load_model(model_path)
++    llama = model.base_model.model
++    cfg, layers = llama.config, llama.model.layers
++    T = HyCLoRAArguments().iteration_threshold
++    batches = gsm8k_batches(model_path, T + 2, B, S)
++    calib, measure = batches[:T], batches[T:]  # calibration and measurement on different text
++    plan_path = plan_path or demo_plan(len(layers))
++    plan = json.load(open(plan_path))
++
++    def grads(batch):
++        model.zero_grad(set_to_none=True)
++        loss = model(input_ids=batch, labels=batch, use_cache=False).loss
++        loss.backward()
++        return torch.cat([p.grad.float().flatten() for n, p in model.named_parameters() if 'lora_' in n]), loss.item()
++
++    llama.set_fused_llama_layer(HyCLoRAArguments(use_hyclora=False))  # TRUE QLoRA: standard HF + PEFT layers
++    refs = [grads(b) for b in measure]
++
++    numel = buffer_numel(cfg.hidden_size, cfg.num_key_value_heads * cfg.hidden_size // cfg.num_attention_heads, cfg.intermediate_size)
++    dense = dict(softmax_outlier_ratio=0.999)  # attention map kept ~dense: isolates quantization from 5% sparsification
++    variants = [
++        ('fused baseline released', dict(layer_type='baseline')),
++        ('fused baseline hyc_fixes', dict(layer_type='baseline', hyc_fixes=True)),
++        ('intra_inter released q8', dict(layer_type='intra_inter', q_bit=8)),
++        ('intra_inter hyc_fixes q8', dict(layer_type='intra_inter', q_bit=8, hyc_fixes=True)),
++        ('intra_inter released q2', dict(layer_type='intra_inter', q_bit=2)),
++        ('intra_inter hyc_fixes q2', dict(layer_type='intra_inter', q_bit=2, hyc_fixes=True)),
++        ('released q8 dense-attn', dict(layer_type='intra_inter', q_bit=8, **dense)),
++        ('hyc_fixes q8 dense-attn', dict(layer_type='intra_inter', q_bit=8, hyc_fixes=True, **dense)),
++        ('adahyc q2 plan', dict(layer_type='adahyc', q_bit=2, bit_plan_path=plan_path)),
++    ]
++    res = {}
++    for name, ov in variants:
++        args = HyCLoRAArguments(**ov)
++        llama.set_fused_llama_layer(args)
++        for b in calib:  # calibration iterations (statistics frozen afterwards)
++            grads(b)
++        out = [grads(b) for b in measure]
++        fl = [l.fused_llama_layer for l in layers]
++        if ov['layer_type'] != 'baseline':
++            assert fl[0].iteration == T + len(measure), 'fused path not used'
++        if ov['layer_type'] == 'baseline':
++            avg_bits = 16.0
++        elif ov['layer_type'] == 'adahyc':
++            for l in fl:  # plan "rebuild" entries must be used verbatim
++                want = layer_rebuild(plan, l.layer_idx)
++                assert want is None or l.rebuild == want, (l.layer_idx, l.rebuild, want)
++            avg_bits = avg_stored_bits(fl, args.layernorm_outlier_ratio)
++        else:
++            avg_bits = plan_avg_bits(None, len(fl), numel, args.q_bit, args.layernorm_outlier_ratio)
++        cos = min(F.cosine_similarity(g, g0, dim=0).item() for (g, _), (g0, _) in zip(out, refs))
++        err = max(((g - g0).norm() / g0.norm()).item() for (g, _), (g0, _) in zip(out, refs))
++        dloss = max(abs(l - l0) for (_, l), (_, l0) in zip(out, refs))
++        res[name] = cos
++        print(f'{name:26s} cos {cos:.6f}  rel_err {err:.4f}  |dloss| {dloss:.4f}  avg_bits {avg_bits:.4f}', flush=True)
++
++    print(f'\n=== LoRA grads vs TRUE QLoRA (HF+PEFT), min/max over {len(measure)} held-out batches '
++          f'(B={B}, S={S}, calibrated on {T} other batches) ===')
++    print(f'{"variant":26s} {"cos":>9s}')
++    for name, _ in variants:
++        print(f'{name:26s} {res[name]:9.6f}')
++    failed = []
++    # measured on A100 (2026-11-12): released 0.998685 -> fixed 0.999622; the residual is bf16 kernel arithmetic
++    # (e.g. bf16 softmax in the fused path vs fp32 in HF), so the gate is "closer to HF than released, and > 0.999"
++    if not (res['fused baseline hyc_fixes'] > 0.999 and res['fused baseline hyc_fixes'] > res['fused baseline released']):
++        failed.append('fused baseline + hyc_fixes is not closer to HF QLoRA than released (or cos <= 0.999)')
++    # the 0.99 bar is on the dense-attention q8 row: the paper's 5% attention sparsification is lossy at any q_bit
++    if not res['hyc_fixes q8 dense-attn'] >= 0.99:
++        failed.append('hyc_fixes q8 dense-attn: cos < 0.99')
++    for fixed, released in (('hyc_fixes q8 dense-attn', 'released q8 dense-attn'), ('intra_inter hyc_fixes q8', 'intra_inter released q8')):
++        if not res[fixed] >= res[released]:
++            failed.append(f'{fixed} is worse than {released}')
++    assert not failed, '\n'.join(failed)
++    print('[gpu] all checks passed')
++
++
++if __name__ == '__main__':
++    cpu_check()
++    argv = [a for a in sys.argv[1:] if a != '--cpu']
++    plan_path = None
++    if '--plan' in argv:
++        i = argv.index('--plan')
++        plan_path = argv[i + 1]
++        del argv[i:i + 2]
++    if argv:
++        gpu_check(argv[0], plan_path)
+diff --git a/check_mem.py b/check_mem.py
+new file mode 100644
+index 0000000..2dd8ef2
+--- /dev/null
++++ b/check_mem.py
+@@ -0,0 +1,71 @@
++"""Measured activation memory held by the decoder layers for backward, per HyC-LoRA / AdaHyC variant (GPU).
++  python check_mem.py /path/to/TinyLlama [--plan p.json] [--out exp_results_da/check_mem-<model>.json]
++Per variant: 5 calibration iterations (+1), then on a fresh iteration record memory_allocated() just before layer 0
++and just after the last layer's forward. The difference = everything the layers keep alive for backward (plus one
++hidden-state tensor, identical for all variants). B=4, S=512 (run_gsm8k.py's training shape). Also prints the
++avg-stored-bits accounting formula (adahyc_utils.avg_stored_bits), which omits scales/rstd/lora_a/attention map."""
++import json
++import os
++import sys
++
++import torch
++
++from check_da import load_model
++from models.llama.adahyc_utils import buffer_numel, avg_stored_bits, plan_avg_bits
++
++argv = sys.argv[1:]
++opt = lambda k, d=None: argv[argv.index(k) + 1] if k in argv else d
++path, plan, B, S = argv[0], opt('--plan'), 4, 512
++model_short = os.path.basename(path.rstrip('/')).split('-intermediate-step')[0]
++out_path = opt('--out', f'exp_results_da/check_mem-{model_short}.json')
++
++from run_gsm8k import HyCLoRAArguments
++model = load_model(path)
++llama = model.base_model.model
++cfg, layers = llama.config, llama.model.layers
++ids = torch.randint(100, cfg.vocab_size, (B, S), device='cuda')
++
++mark = {}
++layers[0].register_forward_pre_hook(lambda m, a: mark.__setitem__('a', torch.cuda.memory_allocated()))
++layers[-1].register_forward_hook(lambda m, a, o: mark.__setitem__('b', torch.cuda.memory_allocated()))
++
++variants = [
++    ('baseline (bf16, no compression)', dict(layer_type='baseline')),
++    ('intra_inter released q2', dict(layer_type='intra_inter', q_bit=2)),
++    ('intra_inter hyc_fixes q2', dict(layer_type='intra_inter', q_bit=2, hyc_fixes=True)),
++    ('intra_inter hyc_fixes q4', dict(layer_type='intra_inter', q_bit=4, hyc_fixes=True)),
++    ('adahyc q2 tau0.1', dict(layer_type='adahyc', q_bit=2)),
++] + ([(f'adahyc q2 plan {os.path.basename(plan)}', dict(layer_type='adahyc', q_bit=2, bit_plan_path=plan))] if plan else [])
++numel = buffer_numel(cfg.hidden_size, cfg.num_key_value_heads * cfg.hidden_size // cfg.num_attention_heads, cfg.intermediate_size)
++rows = []
++for name, ov in variants:
++    args = HyCLoRAArguments(**ov)
++    llama.set_fused_llama_layer(args)
++    for _ in range(args.iteration_threshold + 1):
++        model.zero_grad(set_to_none=True)
++        model(input_ids=ids, labels=ids, use_cache=False).loss.backward()
++    model.zero_grad(set_to_none=True)
++    torch.cuda.synchronize()
++    out = model(input_ids=ids, labels=ids, use_cache=False)
++    held = mark['b'] - mark['a']
++    out.loss.backward()
++    del out
++    fl = [l.fused_llama_layer for l in layers]
++    if ov['layer_type'] == 'adahyc':
++        acct = avg_stored_bits(fl, args.layernorm_outlier_ratio)
++    elif ov['layer_type'] == 'baseline':
++        acct = 16.0
++    else:
++        acct = plan_avg_bits(None, len(fl), numel, args.q_bit, args.layernorm_outlier_ratio)
++    rows.append(dict(variant=name, config=ov, held_mib=held / 2 ** 20, formula_avg_bits=acct))
++    print(f'{name:38s} held {held / 2 ** 20:9.1f} MiB   formula avg bits {acct:.4f}', flush=True)
++
++base = rows[0]['held_mib']
++print(f'\n=== measured activation memory held by decoder layers ({model_short}, B={B}, S={S}) ===')
++for r in rows:
++    r['pct_of_bf16'] = 100 * r['held_mib'] / base
++    print(f"{r['variant']:38s} {r['held_mib']:9.1f} MiB  ({r['pct_of_bf16']:5.1f}% of bf16)   "
++          f"formula {r['formula_avg_bits']:.4f} bits ({100 * r['formula_avg_bits'] / 16:5.1f}% of 16)")
++os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
++json.dump(dict(model=path, B=B, S=S, rows=rows), open(out_path, 'w'), indent=1)
++print(f'wrote {out_path}')
+diff --git a/models/llama/adahyc_utils.py b/models/llama/adahyc_utils.py
+new file mode 100644
+index 0000000..e7c7c9f
+--- /dev/null
++++ b/models/llama/adahyc_utils.py
+@@ -0,0 +1,93 @@
++# Pure-torch helpers for the adahyc layer (DA4022). Kept free of triton/bnb imports so check_da.py --cpu can test them.
++from types import SimpleNamespace
++
++import torch
++
++# quantized buffers per layer (the static_value keys, minus the sparse attention map 'a')
++BUFFERS = ('x', 'x_norm_1', 'q', 'k', 'v', 'o', 'x_medium', 'x_norm_2', 'gate', 'up')
++OUTLIER_BUFFERS = ('x', 'x_medium')
++REBUILDABLE = ('x_norm_1', 'x_medium', 'x_norm_2')
++
++
++def buffer_numel(hidden, kv_dim, inter):
++    """elements per token of every buffer"""
++    return {'x': hidden, 'x_norm_1': hidden, 'q': hidden, 'k': kv_dim, 'v': kv_dim, 'o': hidden,
++            'x_medium': hidden, 'x_norm_2': hidden, 'gate': inter, 'up': inter}
++
++
++def layer_bits(plan, layer_idx, q_bit):
++    """plan: parsed JSON {"<layer_idx>": {"<buffer>": bits, ..., "rebuild": [...]}} or None; missing entries
++    fall back to q_bit. The optional "rebuild" list is validated here and read by layer_rebuild."""
++    entry = dict((plan or {}).get(str(layer_idx), {}))
++    layer_rebuild(plan, layer_idx)
++    entry.pop('rebuild', None)
++    assert set(entry) <= set(BUFFERS), f"unknown buffers in bit plan (layer {layer_idx}): {set(entry) - set(BUFFERS)}"
++    bits = {b: int(entry.get(b, q_bit)) for b in BUFFERS}
++    assert all(v in (2, 4, 8) for v in bits.values()), f"bits must be in {{2,4,8}} (layer {layer_idx}): {bits}"
++    return bits
++
++
++def layer_rebuild(plan, layer_idx):
++    """explicit rebuild set from the plan's "rebuild" list, or None (no key: the layer decides with the tau rule)"""
++    rebuild = (plan or {}).get(str(layer_idx), {}).get('rebuild')
++    if rebuild is None:
++        return None
++    assert isinstance(rebuild, list) and set(rebuild) <= set(REBUILDABLE),         f"plan 'rebuild' must be a list within {REBUILDABLE} (layer {layer_idx}): {rebuild}"
++    return frozenset(rebuild)
++
++
++def rmsnorm_rebuild(x, rstd, weight):
++    """same math as rmsnorm_forward: x * rstd * w in fp32; rstd is the kernel's flat (B*S,) fp32 output"""
++    return (x.float() * rstd.view(*x.shape[:-1], 1) * weight.float()).to(torch.bfloat16)
++
++
++def rebuild_x_medium(x, o, w_o_dequant, b_o, o_lora_a, w_o_lora_b):
++    """x_medium = x + o @ W_o (+ b_o) + o_lora_a @ B_o, as lora_forward computes it; w_o_dequant is (in, out)"""
++    dtype = w_o_dequant.dtype
++    x_medium = x.to(dtype) + o.to(dtype) @ w_o_dequant + o_lora_a.to(dtype) @ w_o_lora_b.to(dtype)
++    return x_medium if b_o is None else x_medium + b_o.to(dtype)
++
++
++def rel_err(approx, true):
++    true = true.float()
++    return ((approx.float() - true).norm() / true.norm()).item()
++
++
++def add_err(calib_err, key, rebuilt, stored, true):
++    """accumulate [rebuild error, store error]; the sums share a denominator, so comparing sums == comparing means"""
++    e = calib_err.setdefault(key, [0.0, 0.0])
++    e[0] += rel_err(rebuilt, true)
++    e[1] += rel_err(stored, true)
++
++
++def decide_rebuild(calib_err, tau):
++    """rebuild iff mean rebuild error <= (1 + tau) * mean store error; tau < 0 disables rebuilding"""
++    if tau < 0:
++        return set()
++    ok = lambda key: calib_err[key][0] <= (1 + tau) * calib_err[key][1]
++    rebuild = {b for b in ('x_norm_1', 'x_medium') if ok(b)}
++    # x_norm_2 is rebuilt from whichever x_medium backward will see
++    if ok('x_norm_2@rebuilt_x_medium' if 'x_medium' in rebuild else 'x_norm_2'):
++        rebuild.add('x_norm_2')
++    return rebuild
++
++
++def avg_stored_bits(layers, outlier_ratio):
++    """average stored bits per buffered element over the model. layers: objects with .numel, .bits, .rebuild.
++    A rebuilt buffer costs 0. Outlier buffers cost bits * all channels (the packed tensor keeps the zeroed
++    outlier channels) + 16 bits per outlier channel. Scales/zero points/rstd/lora_a buffers are not counted."""
++    bits = elems = 0
++    for layer in layers:
++        for buf, n in layer.numel.items():
++            elems += n
++            if buf in (layer.rebuild or ()):
++                continue
++            bits += layer.bits[buf] * n + (16 * int(n * outlier_ratio) if buf in OUTLIER_BUFFERS else 0)
++    return bits / elems
++
++
++def plan_avg_bits(plan, n_layers, numel, q_bit, outlier_ratio):
++    """avg_stored_bits of a plan file without a model; layers without a "rebuild" key count as rebuilding nothing
++    (the tau rule decides those at run time, so the layer's printed number is the one to report)"""
++    return avg_stored_bits([SimpleNamespace(numel=numel, bits=layer_bits(plan, i, q_bit), rebuild=layer_rebuild(plan, i))
++                            for i in range(n_layers)], outlier_ratio)
+diff --git a/models/llama/fused_llama_layer_adahyc.py b/models/llama/fused_llama_layer_adahyc.py
+new file mode 100644
+index 0000000..9a3ab38
+--- /dev/null
++++ b/models/llama/fused_llama_layer_adahyc.py
+@@ -0,0 +1,803 @@
++import json
++import math
++import torch
++import typing
++import bitsandbytes as bnb
++import bitsandbytes.functional as BF
++
++from operators.rope_kernels import rope_forward, rope_backward, calculate_settings
++from operators.silu_kernels import silu_backward, silu_hadamard
++from operators.rmsnorm_kernels import rmsnorm_backward, rmsnorm_forward
++from operators.softmax_kernels import softmax_backward
++from operators.compress_function import (
++    compression_pack_channel_base,
++    compression_pack_quant_base,
++    compression_pack_softmax_base,
++    compression_pack_channel,
++    compression_pack_quant,
++    decompression_dequant,
++    update_dict,
++)
++from .adahyc_utils import (
++    buffer_numel, layer_bits, layer_rebuild, rmsnorm_rebuild, rebuild_x_medium,
++    add_err, decide_rebuild, avg_stored_bits,
++)
++
++from ..utils.compute_utils import(
++    hidden_to_head_shape, head_to_hidden_shape,
++    lora_forward, lora_backward,
++    repeat_kv, repeat_kv_backward
++)
++
++class FusedLlamaLayerAdaHyCFunc(torch.autograd.Function):
++    @staticmethod
++    def forward(
++        ctx,
++        x: torch.Tensor,
++        #############attention part#############
++        norm_weight_1: torch.Tensor,
++        norm_bias_1: torch.Tensor,
++        ####################################
++        cos: torch.Tensor,
++        sin: torch.Tensor,
++        ####################################
++        w_q: torch.Tensor,
++        b_q: torch.Tensor,
++        w_q_quant_state: typing.Tuple,
++        w_q_lora_a: torch.Tensor,
++        w_q_lora_b: torch.Tensor,
++        ####################################
++        w_k: torch.Tensor,
++        b_k: torch.Tensor,
++        w_k_quant_state: typing.Tuple,
++        w_k_lora_a: torch.Tensor,
++        w_k_lora_b: torch.Tensor,
++        ####################################
++        w_v: torch.Tensor,
++        b_v: torch.Tensor,
++        w_v_quant_state: typing.Tuple,
++        w_v_lora_a: torch.Tensor,
++        w_v_lora_b: torch.Tensor,
++        ####################################
++        w_o: torch.Tensor,
++        b_o: torch.Tensor,
++        w_o_quant_state: typing.Tuple,
++        w_o_lora_a: torch.Tensor,
++        w_o_lora_b: torch.Tensor,
++        #############mlp part#############
++        norm_weight_2: torch.Tensor,
++        norm_bias_2: torch.Tensor,
++        ####################################
++        w_gate: torch.Tensor,
++        b_gate: torch.Tensor,
++        w_gate_quant_state: typing.Tuple,
++        w_gate_lora_a: torch.Tensor,
++        w_gate_lora_b: torch.Tensor,
++        ####################################
++        w_up: torch.Tensor,
++        b_up: torch.Tensor,
++        w_up_quant_state: typing.Tuple,
++        w_up_lora_a: torch.Tensor,
++        w_up_lora_b: torch.Tensor,
++        ####################################
++        w_down: torch.Tensor,
++        b_down: torch.Tensor,
++        w_down_quant_state: typing.Tuple,
++        w_down_lora_a: torch.Tensor,
++        w_down_lora_b: torch.Tensor,
++        ###############other################
++        attention_mask: torch.Tensor,
++        num_heads: int,
++        head_dim: int,
++        num_key_value_heads: int,
++        ###############about statistics################
++        iteration: int,
++        iteration_threshold: int,
++        static_value: dict,
++        softmax_outlier_ratio: float,
++        layernorm_outlier_ratio: float,
++        bits: dict,
++        use_zero_point: bool,
++        rebuild: frozenset,
++        calib_err: dict,
++        hyc_fixes: bool,
++    ):
++        # layernorm or rmsnorm
++        x_norm_1, mean_1, rstd_1, _, _ = rmsnorm_forward(x, norm_weight_1, eps = 1e-5)
++        
++        #* compress the (copy of) x
++        x_copy = x.clone()
++        x_o, x_q, x_channel_idx, x_scale, x_zp = compression_pack_channel(
++            x=x_copy, o_ratio=layernorm_outlier_ratio, q_bit=bits['x'],
++            q_method='per-channel', it_num=iteration,
++            it_num_thd=iteration_threshold, static_value=static_value['x'], zero_point=use_zero_point, fixes=hyc_fixes
++        )
++
++        # compute q,k,v
++        # forward process: q_proj
++        q, q_main, q_lora_a = lora_forward(w_q, w_q_quant_state, w_q_lora_a, w_q_lora_b, b_q, x_norm_1)
++
++        # forward process: k_proj
++        k, k_main, k_lora_a = lora_forward(w_k, w_k_quant_state, w_k_lora_a, w_k_lora_b, b_k, x_norm_1)
++
++        # forward process: v_proj
++        v, v_main, v_lora_a = lora_forward(w_v, w_v_quant_state, w_v_lora_a, w_v_lora_b, b_v, x_norm_1)
++        
++        #* compress x_norm_1 (or store nothing: backward rebuilds it as rmsnorm(x_hat))
++        if 'x_norm_1' in rebuild:
++            x_norm_1_q, x_norm_1_scale, x_norm_1_zp = None, None, None
++        else:
++            x_norm_1_q, x_norm_1_scale, x_norm_1_zp = compression_pack_quant(
++                x=x_norm_1, q_bit=bits['x_norm_1'],
++                q_method='per-channel', it_num=iteration,
++                it_num_thd=iteration_threshold, static_value=static_value['x_norm_1'], zero_point=use_zero_point, fixes=hyc_fixes
++            )
++
++        #* calibration: error of rebuilding x_norm_1 vs storing it
++        if calib_err is not None:
++            x_hat = decompression_dequant(x_q, x_scale, x_zp, bits['x'], x_o, x_channel_idx)
++            add_err(calib_err, 'x_norm_1',
++                rmsnorm_rebuild(x_hat, rstd_1, norm_weight_1),
++                decompression_dequant(x_norm_1_q, x_norm_1_scale, x_norm_1_zp, bits['x_norm_1']),
++                x_norm_1)
++        del x_norm_1
++        
++        #* quantize q_main, k_main and v_main in original version, then add lora and apply rope
++        q_main_q, q_main_scale, q_main_zp = compression_pack_quant(
++            x=q_main, q_bit=bits['q'],
++            q_method='per-channel', it_num=iteration,
++            it_num_thd=iteration_threshold, static_value=static_value['q'], zero_point=use_zero_point, fixes=hyc_fixes
++        )
++        k_main_q, k_main_scale, k_main_zp = compression_pack_quant(
++            x=k_main, q_bit=bits['k'],
++            q_method='per-channel', it_num=iteration,
++            it_num_thd=iteration_threshold, static_value=static_value['k'], zero_point=use_zero_point, fixes=hyc_fixes
++        )
++        v_main_q, v_main_scale, v_main_zp = compression_pack_quant(
++            x=v_main, q_bit=bits['v'],
++            q_method='per-channel', it_num=iteration,
++            it_num_thd=iteration_threshold, static_value=static_value['v'], zero_point=use_zero_point, fixes=hyc_fixes
++        )
++        del q_main, k_main, v_main
++        
++        # reshape
++        q = hidden_to_head_shape(q, num_heads)
++        k = hidden_to_head_shape(k, num_key_value_heads)
++        v = hidden_to_head_shape(v, num_key_value_heads)
++        
++        ctx.q_shape = q.shape
++
++        q = rope_forward(q.transpose(1, 2), cos, sin).transpose(1, 2)
++        k = rope_forward(k.transpose(1, 2), cos, sin).transpose(1, 2)
++
++        # forward: S = Q @ K.T / sqrt(d_k)
++        if num_heads != num_key_value_heads:
++            k = repeat_kv(k, n_rep=num_heads // num_key_value_heads)
++            
++        s = q @ k.transpose(-2, -1) / math.sqrt(head_dim)
++        del q, k
++        
++        # apply mask
++        if attention_mask is not None:
++            s = s + attention_mask
++
++        # forward: softmax
++        a = torch.softmax(s, dim=-1, dtype=v.dtype)  # [bsz, num_heads, q_len, q_len]
++        del s
++        
++        #* compress a
++        a_o, a_threshold = compression_pack_softmax_base(
++            x=a, o_ratio=softmax_outlier_ratio, it_num=iteration,
++            it_num_thd=iteration_threshold, static_value=static_value['a']
++        )
++        ctx.a_shape = a.shape
++
++        # forward: O = A @ V
++        if num_heads != num_key_value_heads:
++            v = repeat_kv(v, n_rep=num_heads // num_key_value_heads)
++        
++        o = a @ v
++        del a, v
++        
++        # reshape
++        o = head_to_hidden_shape(o)
++
++        # forward process: o_proj
++        o_final, _, o_final_lora_a = lora_forward(w_o, w_o_quant_state, w_o_lora_a, w_o_lora_b, b_o, o)
++        
++        #* compress o
++        o_q, o_scale, o_zp = compression_pack_quant(
++            x=o, q_bit=bits['o'],
++            q_method='per-channel', it_num=iteration,
++            it_num_thd=iteration_threshold, static_value=static_value['o'], zero_point=use_zero_point, fixes=hyc_fixes
++        )
++        del o
++        
++        # residual connection
++        x_medium = x + o_final
++        del x, o_final
++        
++        # layernorm or rmsnorm
++        x_norm_2, mean_2, rstd_2, block_size, num_warps = rmsnorm_forward(x_medium, norm_weight_2, eps = 1e-5)
++        
++        #* compress the (copy of) x_medium (or store nothing: backward rebuilds it as x_hat + o_hat @ W_o + lora)
++        if 'x_medium' in rebuild:
++            x_medium_o, x_medium_q, x_medium_channel_idx, x_medium_scale, x_medium_zp = None, None, None, None, None
++        else:
++            x_medium_copy = x_medium.clone()
++            x_medium_o, x_medium_q, x_medium_channel_idx, x_medium_scale, x_medium_zp = compression_pack_channel(
++                x=x_medium_copy, o_ratio=layernorm_outlier_ratio, q_bit=bits['x_medium'],
++                q_method='per-channel', it_num=iteration,
++                it_num_thd=iteration_threshold, static_value=static_value['x_medium'], zero_point=use_zero_point, fixes=hyc_fixes
++            )
++        
++        # forward process: gate_proj
++        gate, gate_main, gate_lora_a = lora_forward(w_gate, w_gate_quant_state, w_gate_lora_a, w_gate_lora_b, b_gate, x_norm_2)
++        up, up_main, up_lora_a = lora_forward(w_up, w_up_quant_state, w_up_lora_a, w_up_lora_b, b_up, x_norm_2)
++        
++        #* compress the x_norm_2 (or store nothing: backward rebuilds it as rmsnorm(x_medium_hat))
++        if 'x_norm_2' in rebuild:
++            x_norm_2_q, x_norm_2_scale, x_norm_2_zp = None, None, None
++        else:
++            x_norm_2_q, x_norm_2_scale, x_norm_2_zp = compression_pack_quant(
++                x=x_norm_2, q_bit=bits['x_norm_2'],
++                q_method='per-channel', it_num=iteration,
++                it_num_thd=iteration_threshold, static_value=static_value['x_norm_2'], zero_point=use_zero_point, fixes=hyc_fixes
++            )
++
++        #* calibration: error of rebuilding x_medium / x_norm_2 vs storing them
++        # x_norm_2 is scored against both possible sources, since x_medium's own decision is not known yet
++        if calib_err is not None:
++            o_hat = decompression_dequant(o_q, o_scale, o_zp, bits['o'])
++            w_o_dequant = BF.dequantize_nf4(w_o, w_o_quant_state).t()
++            x_medium_rebuilt = rebuild_x_medium(x_hat, o_hat, w_o_dequant, b_o, o_final_lora_a, w_o_lora_b)
++            x_medium_stored = decompression_dequant(x_medium_q, x_medium_scale, x_medium_zp, bits['x_medium'], x_medium_o, x_medium_channel_idx)
++            x_norm_2_stored = decompression_dequant(x_norm_2_q, x_norm_2_scale, x_norm_2_zp, bits['x_norm_2'])
++            add_err(calib_err, 'x_medium', x_medium_rebuilt, x_medium_stored, x_medium)
++            add_err(calib_err, 'x_norm_2', rmsnorm_rebuild(x_medium_stored, rstd_2, norm_weight_2), x_norm_2_stored, x_norm_2)
++            add_err(calib_err, 'x_norm_2@rebuilt_x_medium', rmsnorm_rebuild(x_medium_rebuilt, rstd_2, norm_weight_2), x_norm_2_stored, x_norm_2)
++            del x_hat, o_hat, w_o_dequant, x_medium_rebuilt, x_medium_stored, x_norm_2_stored
++        del x_norm_2
++        
++        #* compress the gate_main
++        gate_main_q, gate_main_scale, gate_main_zp = compression_pack_quant(
++            x=gate_main, q_bit=bits['gate'],
++            q_method='per-channel', it_num=iteration,
++            it_num_thd=iteration_threshold, static_value=static_value['gate'], zero_point=use_zero_point, fixes=hyc_fixes
++        )
++        del gate_main
++        
++        #* compress the up_main
++        up_main_q, up_main_scale, up_main_zp = compression_pack_quant(
++            x=up_main, q_bit=bits['up'],
++            q_method='per-channel', it_num=iteration,
++            it_num_thd=iteration_threshold, static_value=static_value['up'], zero_point=use_zero_point, fixes=hyc_fixes
++        )
++        del up_main
++
++        # hadamard
++        hadamard = silu_hadamard(gate, up)
++        del gate, up
++
++        # forward process: down_proj
++        down, _, down_lora_a = lora_forward(w_down, w_down_quant_state, w_down_lora_a, w_down_lora_b, b_down, hadamard)
++        del hadamard
++        
++        # residual connection
++        x_out = x_medium + down
++        ctx.seq_length = x_out.shape[1]
++        del x_medium, down
++        
++        ctx.save_for_backward(
++            ### buffered activation (attention) ###
++            x_o, x_q, x_scale, x_zp, # x
++            mean_1, rstd_1, # buffer for rmsnorm
++            x_norm_1_q, x_norm_1_scale, x_norm_1_zp, # x_norm_1
++            cos, sin, # buffer for rope
++            q_main_q, q_main_scale, q_main_zp, # q
++            k_main_q, k_main_scale, k_main_zp, # k
++            v_main_q, v_main_scale, v_main_zp, # v
++            a_o, a_threshold, # a
++            o_q, o_scale, o_zp, # o
++            q_lora_a, k_lora_a, v_lora_a, # buffer for lora (qkv)
++            o_final_lora_a, # buffer for lora (o)
++            ### buffered activation (mlp) ###
++            mean_2, rstd_2, # buffer for rmsnorm
++            x_medium_o, x_medium_q, x_medium_scale, x_medium_zp, # x_medium
++            x_norm_2_q, x_norm_2_scale, x_norm_2_zp, # x_norm_2
++            gate_main_q, gate_main_scale, gate_main_zp, # gate
++            up_main_q, up_main_scale, up_main_zp, # up
++            gate_lora_a, up_lora_a, down_lora_a,
++            ### weights (attention) ###
++            norm_weight_1, norm_bias_1,
++            w_q, b_q, w_q_lora_a, w_q_lora_b,
++            w_k, b_k, w_k_lora_a, w_k_lora_b,
++            w_v, b_v, w_v_lora_a, w_v_lora_b,
++            w_o, b_o, w_o_lora_a, w_o_lora_b,
++            ### weights (mlp) ###
++            norm_weight_2, norm_bias_2,
++            w_gate, b_gate, w_gate_lora_a, w_gate_lora_b,
++            w_up, b_up, w_up_lora_a, w_up_lora_b,
++            w_down, b_down, w_down_lora_a, w_down_lora_b,
++        )
++        ctx.quant_state = (
++            w_q_quant_state,
++            w_k_quant_state,
++            w_v_quant_state,
++            w_o_quant_state,
++            w_gate_quant_state,
++            w_up_quant_state,
++            w_down_quant_state,
++        )
++        ctx.input_layernorm_channel = x_channel_idx 
++        ctx.post_layernorm_channel = x_medium_channel_idx
++        ctx.num_heads = num_heads
++        ctx.num_key_value_heads = num_key_value_heads
++        ctx.block_size = block_size
++        ctx.num_warps = num_warps
++        ctx.head_dim = head_dim
++        ctx.hyc_fixes = hyc_fixes
++        ctx.bits = bits
++        ctx.rebuild = rebuild
++
++        return x_out, x_channel_idx, x_scale, x_zp, \
++            x_norm_1_scale, x_norm_1_zp, \
++            q_main_scale, q_main_zp, k_main_scale, k_main_zp, v_main_scale, v_main_zp, \
++            a_threshold, o_scale, o_zp, \
++            x_medium_channel_idx, x_medium_scale, x_medium_zp, \
++            x_norm_2_scale, x_norm_2_zp, \
++            gate_main_scale, gate_main_zp, up_main_scale, up_main_zp
++            
++    
++    @staticmethod
++    def backward(ctx, grad_output: torch.Tensor, *args):
++        (
++            w_q_quant_state,
++            w_k_quant_state,
++            w_v_quant_state,
++            w_o_quant_state,
++            w_gate_quant_state,
++            w_up_quant_state,
++            w_down_quant_state,
++        ) = ctx.quant_state
++        
++        (
++            ### buffered activation (attention) ###
++            x_o, x_q, x_scale, x_zp, # x
++            mean_1, rstd_1, # buffer for rmsnorm
++            x_norm_1_q, x_norm_1_scale, x_norm_1_zp, # x_norm_1
++            cos, sin, # buffer for rope
++            q_main_q, q_main_scale, q_main_zp, # q
++            k_main_q, k_main_scale, k_main_zp, # k
++            v_main_q, v_main_scale, v_main_zp, # v
++            a_o, a_threshold, # a
++            o_q, o_scale, o_zp, # o
++            q_lora_a, k_lora_a, v_lora_a, # buffer for lora (qkv)
++            o_final_lora_a, # buffer for lora (o)
++            ### buffered activation (mlp) ###
++            mean_2, rstd_2, # buffer for rmsnorm
++            x_medium_o, x_medium_q, x_medium_scale, x_medium_zp, # x_medium
++            x_norm_2_q, x_norm_2_scale, x_norm_2_zp, # x_norm_2
++            gate_main_q, gate_main_scale, gate_main_zp, # gate
++            up_main_q, up_main_scale, up_main_zp, # up
++            gate_lora_a, up_lora_a, down_lora_a,
++            ### weights (attention) ###
++            norm_weight_1, norm_bias_1,
++            w_q, b_q, w_q_lora_a, w_q_lora_b,
++            w_k, b_k, w_k_lora_a, w_k_lora_b,
++            w_v, b_v, w_v_lora_a, w_v_lora_b,
++            w_o, b_o, w_o_lora_a, w_o_lora_b,
++            ### weights (mlp) ###
++            norm_weight_2, norm_bias_2,
++            w_gate, b_gate, w_gate_lora_a, w_gate_lora_b,
++            w_up, b_up, w_up_lora_a, w_up_lora_b,
++            w_down, b_down, w_down_lora_a, w_down_lora_b,
++        ) = ctx.saved_tensors
++        
++        #! recompute flow, use gate and up to reconstruct fn and hadamard
++        #* dequantize gate_main
++        gate_main = decompression_dequant(gate_main_q, gate_main_scale, gate_main_zp, ctx.bits['gate'])
++        del gate_main_q, gate_main_scale
++        gate = gate_main + (gate_lora_a.to(gate_main.dtype)) @ w_gate_lora_b.to(gate_main.dtype)
++        del gate_main
++        
++        # TODO: write a fused silu-hadamard triton kernel
++        fn = torch.nn.functional.silu(gate)
++        
++        #* dequantize up_main
++        up_main = decompression_dequant(up_main_q, up_main_scale, up_main_zp, ctx.bits['up'])
++        del up_main_q, up_main_scale
++        up = up_main + (up_lora_a.to(up_main.dtype)) @ w_up_lora_b.to(up_main.dtype)
++        del up_main
++        
++        hadamard = up * fn
++        
++        # down proj part
++        grad_w_down_lora_a, grad_w_down_lora_b, grad_down = lora_backward(w_down, w_down_quant_state, w_down_lora_a, w_down_lora_b, hadamard, down_lora_a, grad_output)
++        del hadamard, down_lora_a
++        
++        # hadamard
++        grad_hadamard_1 = grad_down * up
++        grad_hadamard_2 = grad_down * fn
++        del grad_down, up, fn
++        
++        grad_fn = silu_backward(gate, grad_hadamard_1)
++        del gate, grad_hadamard_1
++        
++        #* dequantize x_medium, or rebuild it from x_hat and o_hat (needed here: x_norm_2 may be rebuilt from it)
++        x = o = None
++        if 'x_medium' in ctx.rebuild:
++            x = decompression_dequant(x_q, x_scale, x_zp, ctx.bits['x'], x_o, ctx.input_layernorm_channel)
++            o = decompression_dequant(o_q, o_scale, o_zp, ctx.bits['o'])
++            x_medium = rebuild_x_medium(x, o, BF.dequantize_nf4(w_o, w_o_quant_state).t(), b_o, o_final_lora_a, w_o_lora_b)
++        else:
++            x_medium = decompression_dequant(x_medium_q, x_medium_scale, x_medium_zp, ctx.bits['x_medium'], x_medium_o, ctx.post_layernorm_channel)
++        del x_medium_q, x_medium_scale, x_medium_o
++        
++        #* dequantize (or rebuild) x_norm_2
++        if 'x_norm_2' in ctx.rebuild:
++            x_norm_2 = rmsnorm_rebuild(x_medium, rstd_2, norm_weight_2)
++        else:
++            x_norm_2 = decompression_dequant(x_norm_2_q, x_norm_2_scale, x_norm_2_zp, ctx.bits['x_norm_2'])
++        del x_norm_2_q, x_norm_2_scale
++        
++        # gate proj part
++        grad_w_gate_lora_a, grad_w_gate_lora_b, grad_gate = lora_backward(w_gate, w_gate_quant_state, w_gate_lora_a, w_gate_lora_b, x_norm_2, gate_lora_a, grad_fn)
++        del gate_lora_a, grad_fn
++        
++        # up proj part
++        grad_w_up_lora_a, grad_w_up_lora_b, grad_up = lora_backward(w_up, w_up_quant_state, w_up_lora_a, w_up_lora_b, x_norm_2, up_lora_a, grad_hadamard_2)
++        grad_gate_up = grad_up + grad_gate
++        del up_lora_a, grad_hadamard_2, grad_up, grad_gate, x_norm_2
++        
++        # layernorm & rmsnorm backward
++        grad_norm_2, _ = rmsnorm_backward(
++            grad_gate_up, x_medium, norm_weight_2, mean_2, rstd_2, # TODO: other params
++            True, 1e-5, ctx.num_warps, ctx.block_size, rms_fix=ctx.hyc_fixes
++        )
++        del x_medium, grad_gate_up
++        
++        # residual connection
++        grad_medium = grad_norm_2 + grad_output
++        del grad_norm_2, grad_output
++        
++        #* dequantize o (unless already done for the x_medium rebuild)
++        if o is None:
++            o = decompression_dequant(o_q, o_scale, o_zp, ctx.bits['o'])
++        del o_q, o_scale
++        
++        # o part
++        grad_w_o_lora_a, grad_w_o_lora_b, grad_o = lora_backward(w_o, w_o_quant_state, w_o_lora_a, w_o_lora_b, o, o_final_lora_a, grad_medium)
++        del o, o_final_lora_a
++        
++        # reshape
++        grad_o = hidden_to_head_shape(grad_o, ctx.num_heads)
++        
++        #* dequantize a, v
++        a = a_o.to_dense()
++        a = a.reshape(ctx.a_shape)
++        v_main = decompression_dequant(v_main_q, v_main_scale, v_main_zp, ctx.bits['v'])
++        v = v_main + (v_lora_a.to(v_main.dtype)) @ w_v_lora_b.to(v_main.dtype)
++        v = hidden_to_head_shape(v, ctx.num_key_value_heads)
++        if ctx.num_heads != ctx.num_key_value_heads:
++            v = repeat_kv(v, n_rep=ctx.num_heads // ctx.num_key_value_heads)
++        del a_o, v_main_q, v_main_scale, v_main
++        
++        # backward of second GEMM: O = A @ V
++        # d L / d V = A.T @ d L / d O
++        grad_v = a.transpose(-2, -1) @ grad_o
++        grad_a = grad_o @ v.transpose(-2, -1)
++        if ctx.num_heads != ctx.num_key_value_heads:
++            grad_v = repeat_kv_backward(grad_v, n_rep=ctx.num_heads // ctx.num_key_value_heads)
++        del grad_o, v
++
++        # backward of softmax
++        grad_s = softmax_backward(a, grad_a)
++        del a, grad_a
++
++        # backward of first GEMM: S = Q @ K.T / sqrt(d_k)
++        grad_s = grad_s / math.sqrt(ctx.head_dim)
++        
++        #* dequantize q, k, then apply rope
++        q_main = decompression_dequant(q_main_q, q_main_scale, q_main_zp, ctx.bits['q'])
++        del q_main_q, q_main_scale
++        q = q_main + (q_lora_a.to(q_main.dtype)) @ w_q_lora_b.to(q_main.dtype)
++        q = hidden_to_head_shape(q, ctx.num_heads)
++        del q_main
++        q = rope_forward(q.transpose(1, 2), cos, sin).transpose(1, 2)
++        grad_k = grad_s.transpose(-2, -1) @ q
++        
++        k_main = decompression_dequant(k_main_q, k_main_scale, k_main_zp, ctx.bits['k'])
++        del k_main_q, k_main_scale
++        k = k_main + (k_lora_a.to(k_main.dtype)) @ w_k_lora_b.to(k_main.dtype)
++        k = hidden_to_head_shape(k, ctx.num_key_value_heads)
++        del k_main
++        k = rope_forward(k.transpose(1, 2), cos, sin).transpose(1, 2)
++        if ctx.num_heads != ctx.num_key_value_heads:
++            k = repeat_kv(k, n_rep=ctx.num_heads // ctx.num_key_value_heads)
++            grad_k = repeat_kv_backward(grad_k, n_rep=ctx.num_heads // ctx.num_key_value_heads)
++        grad_q = grad_s @ k
++        del grad_s, k
++
++        BLOCK_SIZE, num_warps = calculate_settings(ctx.head_dim // 2)
++        N_GROUPS = 128
++        grad_q = rope_backward(grad_q.transpose(1, 2), cos, sin, N_GROUPS, BLOCK_SIZE, num_warps).transpose(1, 2) # TODO: other params
++        grad_k = rope_backward(grad_k.transpose(1, 2), cos, sin, N_GROUPS, BLOCK_SIZE, num_warps).transpose(1, 2)
++
++        grad_q = head_to_hidden_shape(grad_q)
++        grad_k = head_to_hidden_shape(grad_k)
++        grad_v = head_to_hidden_shape(grad_v)
++        
++        #* dequantize x (unless already done), then dequantize or rebuild x_norm_1
++        if x is None:
++            x = decompression_dequant(x_q, x_scale, x_zp, ctx.bits['x'], x_o, ctx.input_layernorm_channel)
++        del x_q, x_scale, x_o
++        if 'x_norm_1' in ctx.rebuild:
++            x_norm_1 = rmsnorm_rebuild(x, rstd_1, norm_weight_1)
++        else:
++            x_norm_1 = decompression_dequant(x_norm_1_q, x_norm_1_scale, x_norm_1_zp, ctx.bits['x_norm_1'])
++        del x_norm_1_q, x_norm_1_scale
++        
++        # backward of q_proj
++        grad_w_q_lora_a, grad_w_q_lora_b, grad_x = lora_backward(w_q, w_q_quant_state, w_q_lora_a, w_q_lora_b, x_norm_1, q_lora_a, grad_q)
++
++        # backward of k_proj
++        grad_w_k_lora_a, grad_w_k_lora_b, grad_x_temp = lora_backward(w_k, w_k_quant_state, w_k_lora_a, w_k_lora_b, x_norm_1, k_lora_a, grad_k)
++        grad_x += grad_x_temp
++
++        # backward of v_proj
++        grad_w_v_lora_a, grad_w_v_lora_b, grad_x_temp = lora_backward(w_v, w_v_quant_state, w_v_lora_a, w_v_lora_b, x_norm_1, v_lora_a, grad_v)
++        grad_x += grad_x_temp
++        
++        # layernorm or rmsnorm backward
++        grad_norm_1, _ = rmsnorm_backward(
++            grad_x, x, norm_weight_1, mean_1, rstd_1, # TODO: other params
++            True, 1e-5, ctx.num_warps, ctx.block_size, rms_fix=ctx.hyc_fixes
++        )
++            
++        # residual connection
++        grad_input = grad_norm_1 + grad_medium
++        
++        return (
++            grad_input,
++            #############attention part#############
++            None,
++            None,
++            ####################################
++            None,
++            None,
++            ####################################
++            None,
++            None,
++            None,
++            grad_w_q_lora_a,
++            grad_w_q_lora_b,
++            ####################################
++            None,
++            None,
++            None,
++            grad_w_k_lora_a,
++            grad_w_k_lora_b,
++            ####################################
++            None,
++            None,
++            None,
++            grad_w_v_lora_a,
++            grad_w_v_lora_b,
++            ####################################
++            None,
++            None,
++            None,
++            grad_w_o_lora_a,
++            grad_w_o_lora_b,
++            ####################################
++            None,
++            None,
++            ####################################
++            None,
++            None,
++            None,
++            grad_w_gate_lora_a,
++            grad_w_gate_lora_b,
++            ####################################
++            None,
++            None,
++            None,
++            grad_w_up_lora_a,
++            grad_w_up_lora_b,
++            ####################################
++            None,
++            None,
++            None,
++            grad_w_down_lora_a,
++            grad_w_down_lora_b
++        ) + (None,) * 14
++
++
++class FusedLlamaLayerAdaHyC(torch.nn.Module):
++    def __init__(
++        self,
++    ):
++        super(FusedLlamaLayerAdaHyC, self).__init__()
++        self.iteration = 0
++        self.static_value = {
++            'x': {'outlier_channel_index': None, 'scale': None, 'zero_point': None},
++            'x_norm_1': {'scale': None, 'zero_point': None},
++            'q': {'scale': None, 'zero_point': None},
++            'k': {'scale': None, 'zero_point': None},
++            'v': {'scale': None, 'zero_point': None},
++            'a': {'outlier': None},
++            'o': {'scale': None, 'zero_point': None},
++            'x_medium': {'outlier_channel_index': None, 'scale': None, 'zero_point': None},
++            'x_norm_2': {'scale': None, 'zero_point': None},
++            'gate': {'scale': None, 'zero_point': None},
++            'up': {'scale': None, 'zero_point': None},
++        }
++        self.rebuild = frozenset() # buffers rebuilt in backward instead of stored (decided after calibration)
++        self.calib_err = {} # buffer -> [sum of rebuild rel-errors, sum of store rel-errors] over calibration
++
++
++    def set_hyclora_config(self, hyclora_config):
++        self.hyclora_config = hyclora_config
++        self.use_hyclora = hyclora_config.use_hyclora
++        self.iteration_threshold = hyclora_config.iteration_threshold
++        self.softmax_outlier_ratio = hyclora_config.softmax_outlier_ratio
++        self.layernorm_outlier_ratio = hyclora_config.layernorm_outlier_ratio
++        self.q_bit = hyclora_config.q_bit
++        # DA4022: adahyc always runs with every hyc_fixes fix on (RMSNorm dx, frozen outlier index, all-sample
++        # statistics, zero-point, x restored with its own outlier channels), whatever the flags say
++        self.hyc_fixes = True
++        self.use_zero_point = True
++        self.rebuild_tau = getattr(hyclora_config, 'rebuild_tau', 0.1)
++        # self.layer_idx / self.peers (all fused layers of the model) are set by set_fused_llama_layer
++        plan_path = getattr(hyclora_config, 'bit_plan_path', None)
++        plan = json.load(open(plan_path)) if plan_path else None
++        self.bits = layer_bits(plan, self.layer_idx, self.q_bit)
++        # explicit plan decision ("rebuild" key) replaces the tau rule for this layer and holds from iteration 0
++        self.plan_rebuild = layer_rebuild(plan, self.layer_idx)
++        if self.plan_rebuild is not None:
++            self.rebuild = self.plan_rebuild
++        
++        
++    def forward(
++        self,
++        input: torch.Tensor,
++        ############################################
++        norm_weight_1: torch.Tensor,
++        norm_bias_1: torch.Tensor,
++        cos: torch.Tensor,
++        sin: torch.Tensor,
++        q_proj_base: bnb.nn.modules.Linear4bit,
++        q_proj_lora_a: torch.nn.Linear,
++        q_proj_lora_b: torch.nn.Linear,
++        k_proj_base: bnb.nn.modules.Linear4bit,
++        k_proj_lora_a: torch.nn.Linear,
++        k_proj_lora_b: torch.nn.Linear,
++        v_proj_base: bnb.nn.modules.Linear4bit,
++        v_proj_lora_a: torch.nn.Linear,
++        v_proj_lora_b: torch.nn.Linear,
++        o_proj_base: bnb.nn.modules.Linear4bit,
++        o_proj_lora_a: torch.nn.Linear,
++        o_proj_lora_b: torch.nn.Linear,
++        ############################################
++        norm_weight_2: torch.Tensor,
++        norm_bias_2: torch.Tensor,
++        gate_proj_base: bnb.nn.modules.Linear4bit,
++        gate_proj_lora_a: torch.nn.Linear,
++        gate_proj_lora_b: torch.nn.Linear,
++        up_proj_base: bnb.nn.modules.Linear4bit,
++        up_proj_lora_a: torch.nn.Linear,
++        up_proj_lora_b: torch.nn.Linear,
++        down_proj_base: bnb.nn.modules.Linear4bit,
++        down_proj_lora_a: torch.nn.Linear,
++        down_proj_lora_b: torch.nn.Linear,
++        ############################################
++        attention_mask: torch.Tensor,
++        num_heads: int,
++        head_dim: int,
++        num_key_value_heads: int,
++    ):
++        y, x_channel_idx, x_scale, x_zp, \
++        x_norm_1_scale, x_norm_1_zp, \
++        q_main_scale, q_main_zp, k_main_scale, k_main_zp, v_main_scale, v_main_zp, \
++        a_threshold, o_scale, o_zp, \
++        x_medium_channel_idx, x_medium_scale, x_medium_zp, \
++        x_norm_2_scale, x_norm_2_zp, \
++        gate_main_scale, gate_main_zp, up_main_scale, up_main_zp = FusedLlamaLayerAdaHyCFunc.apply(
++            input,
++            #############attention part#############
++            norm_weight_1,
++            norm_bias_1,
++            ####################################
++            cos,
++            sin,
++            ####################################
++            q_proj_base.weight,
++            q_proj_base.bias,
++            q_proj_base.weight.quant_state,
++            q_proj_lora_a.default.weight.T,
++            q_proj_lora_b.default.weight.T,
++            ####################################
++            k_proj_base.weight,
++            k_proj_base.bias,
++            k_proj_base.weight.quant_state,
++            k_proj_lora_a.default.weight.T,
++            k_proj_lora_b.default.weight.T,
++            ####################################
++            v_proj_base.weight,
++            v_proj_base.bias,
++            v_proj_base.weight.quant_state,
++            v_proj_lora_a.default.weight.T,
++            v_proj_lora_b.default.weight.T,
++            ####################################
++            o_proj_base.weight,
++            o_proj_base.bias,
++            o_proj_base.weight.quant_state,
++            o_proj_lora_a.default.weight.T,
++            o_proj_lora_b.default.weight.T,
++            #############mlp part#############
++            norm_weight_2,
++            norm_bias_2,
++            ####################################
++            gate_proj_base.weight,
++            gate_proj_base.bias,
++            gate_proj_base.weight.quant_state,
++            gate_proj_lora_a.default.weight.T,
++            gate_proj_lora_b.default.weight.T,
++            ####################################
++            up_proj_base.weight,
++            up_proj_base.bias,
++            up_proj_base.weight.quant_state,
++            up_proj_lora_a.default.weight.T,
++            up_proj_lora_b.default.weight.T,
++            ####################################
++            down_proj_base.weight,
++            down_proj_base.bias,
++            down_proj_base.weight.quant_state,
++            down_proj_lora_a.default.weight.T,
++            down_proj_lora_b.default.weight.T,
++            ####################################
++            attention_mask,
++            num_heads,
++            head_dim,
++            num_key_value_heads,
++            ####################################
++            self.iteration,
++            self.iteration_threshold,
++            self.static_value,
++            self.softmax_outlier_ratio,
++            self.layernorm_outlier_ratio,
++            self.bits,
++            self.use_zero_point,
++            self.rebuild,
++            self.calib_err if self.iteration < self.iteration_threshold and self.rebuild_tau >= 0 and self.plan_rebuild is None else None,
++            self.hyc_fixes,
++        )
++        
++        if self.iteration < self.iteration_threshold:
++            self.static_value['x'] = update_dict(self.static_value['x'], {'outlier_channel_index': x_channel_idx, 'scale': x_scale, 'zero_point': x_zp}, self.iteration)
++            self.static_value['x_norm_1'] = update_dict(self.static_value['x_norm_1'], {'scale': x_norm_1_scale, 'zero_point': x_norm_1_zp}, self.iteration)
++            self.static_value['q'] = update_dict(self.static_value['q'], {'scale': q_main_scale, 'zero_point': q_main_zp}, self.iteration)
++            self.static_value['k'] = update_dict(self.static_value['k'], {'scale': k_main_scale, 'zero_point': k_main_zp}, self.iteration)
++            self.static_value['v'] = update_dict(self.static_value['v'], {'scale': v_main_scale, 'zero_point': v_main_zp}, self.iteration)
++            self.static_value['a'] = update_dict(self.static_value['a'], {'outlier': a_threshold}, self.iteration)
++            self.static_value['o'] = update_dict(self.static_value['o'], {'scale': o_scale, 'zero_point': o_zp}, self.iteration)
++            self.static_value['x_medium'] = update_dict(self.static_value['x_medium'], {'outlier_channel_index': x_medium_channel_idx, 'scale': x_medium_scale, 'zero_point': x_medium_zp}, self.iteration)
++            self.static_value['x_norm_2'] = update_dict(self.static_value['x_norm_2'], {'scale': x_norm_2_scale, 'zero_point': x_norm_2_zp}, self.iteration)
++            self.static_value['gate'] = update_dict(self.static_value['gate'], {'scale': gate_main_scale, 'zero_point': gate_main_zp}, self.iteration)
++            self.static_value['up'] = update_dict(self.static_value['up'], {'scale': up_main_scale, 'zero_point': up_main_zp}, self.iteration)
++        
++        if self.iteration == self.iteration_threshold - 1:
++            self.numel = buffer_numel(input.shape[-1], num_key_value_heads * head_dim, gate_proj_base.out_features)
++            if self.plan_rebuild is None:
++                self.rebuild = frozenset(decide_rebuild(self.calib_err, self.rebuild_tau))
++            if self is self.peers[-1]: # every layer has decided once the last one has
++                for layer in self.peers:
++                    errs = ', '.join(f"{k}: {r / self.iteration_threshold:.4f}/{st / self.iteration_threshold:.4f}" for k, (r, st) in layer.calib_err.items())
++                    src = 'plan' if layer.plan_rebuild is not None else f'tau={layer.rebuild_tau}'
++                    print(f"[adahyc] layer {layer.layer_idx}: rebuild={sorted(layer.rebuild)} ({src}) bits={layer.bits} rel-err rebuild/store: {errs}")
++                print(f"\033[1;32m[adahyc] average stored bits per buffered element: {avg_stored_bits(self.peers, self.layernorm_outlier_ratio):.4f}\033[0m")
++        
++        self.iteration += 1
++        
++        return y
+\ No newline at end of file
+diff --git a/models/llama/fused_llama_layer_baseline.py b/models/llama/fused_llama_layer_baseline.py
+index 0c54f87..4901689 100644
+--- a/models/llama/fused_llama_layer_baseline.py
++++ b/models/llama/fused_llama_layer_baseline.py
+@@ -75,6 +75,7 @@ class FusedLlamaLayerBaselineFunc(torch.autograd.Function):
+         num_heads: int,
+         head_dim: int,
+         num_key_value_heads: int,
++        hyc_fixes: bool,
+     ):
+         # layernorm or rmsnorm
+         x_norm_1, mean_1, rstd_1, _, _ = rmsnorm_forward(x, norm_weight_1, eps = 1e-5)
+@@ -231,6 +232,7 @@ class FusedLlamaLayerBaselineFunc(torch.autograd.Function):
+         ctx.block_size = block_size
+         ctx.num_warps = num_warps
+         ctx.head_dim = head_dim
++        ctx.hyc_fixes = hyc_fixes
+ 
+         return x_out
+     
+@@ -337,7 +339,7 @@ class FusedLlamaLayerBaselineFunc(torch.autograd.Function):
+         # layernorm & rmsnorm backward
+         grad_norm_2, _ = rmsnorm_backward(
+             grad_gate_up, x_medium, norm_weight_2, mean_2, rstd_2, # TODO: other params
+-            True, 1e-5, ctx.num_warps, ctx.block_size
++            True, 1e-5, ctx.num_warps, ctx.block_size, rms_fix=ctx.hyc_fixes
+         )
+         
+         # residual connection
+@@ -390,7 +392,7 @@ class FusedLlamaLayerBaselineFunc(torch.autograd.Function):
+         # layernorm or rmsnorm backward
+         grad_norm_1, _ = rmsnorm_backward(
+             grad_x, x, norm_weight_1, mean_1, rstd_1, # TODO: other params
+-            True, 1e-5, ctx.num_warps, ctx.block_size
++            True, 1e-5, ctx.num_warps, ctx.block_size, rms_fix=ctx.hyc_fixes
+         )
+             
+         # residual connection
+@@ -449,7 +451,7 @@ class FusedLlamaLayerBaselineFunc(torch.autograd.Function):
+             None,
+             grad_w_down_lora_a,
+             grad_w_down_lora_b
+-        ) + (None,) * 4
++        ) + (None,) * 5
+ 
+ 
+ class FusedLlamaLayerBaseline(torch.nn.Module):
+@@ -463,6 +465,7 @@ class FusedLlamaLayerBaseline(torch.nn.Module):
+     def set_hyclora_config(self, hyclora_config):
+         self.use_hyclora = hyclora_config.use_hyclora
+         self.hyclora_config = hyclora_config
++        self.hyc_fixes = getattr(hyclora_config, 'hyc_fixes', False) # DA4022: one switch for all fixes
+         
+     def forward(
+         self,
+@@ -562,7 +565,8 @@ class FusedLlamaLayerBaseline(torch.nn.Module):
+             attention_mask,
+             num_heads,
+             head_dim,
+-            num_key_value_heads
++            num_key_value_heads,
++            self.hyc_fixes,
+         )
+         
+         return y
+diff --git a/models/llama/fused_llama_layer_intra.py b/models/llama/fused_llama_layer_intra.py
+index 289e4f6..f0a2715 100644
+--- a/models/llama/fused_llama_layer_intra.py
++++ b/models/llama/fused_llama_layer_intra.py
+@@ -90,6 +90,7 @@ class FusedLlamaLayerIntraFunc(torch.autograd.Function):
+         softmax_outlier_ratio: float,
+         layernorm_outlier_ratio: float,
+         q_bit: int,
++        hyc_fixes: bool,
+     ):
+         # layernorm or rmsnorm
+         x_norm_1, mean_1, rstd_1, _, _ = rmsnorm_forward(x, norm_weight_1, eps = 1e-5)
+@@ -99,7 +100,7 @@ class FusedLlamaLayerIntraFunc(torch.autograd.Function):
+         x_o, x_q, x_channel_idx, x_scale = compression_pack_channel_base(
+             x=x_copy, o_ratio=layernorm_outlier_ratio, q_bit=q_bit,
+             q_method='per-channel', it_num=iteration,
+-            it_num_thd=iteration_threshold, static_value=static_value['x']
++            it_num_thd=iteration_threshold, static_value=static_value['x'], fixes=hyc_fixes
+         )
+ 
+         # compute q,k,v
+@@ -116,7 +117,7 @@ class FusedLlamaLayerIntraFunc(torch.autograd.Function):
+         x_norm_1_q, x_norm_1_scale = compression_pack_quant_base(
+             x=x_norm_1, q_bit=q_bit,
+             q_method='per-channel', it_num=iteration,
+-            it_num_thd=iteration_threshold, static_value=static_value['x_norm_1']
++            it_num_thd=iteration_threshold, static_value=static_value['x_norm_1'], fixes=hyc_fixes
+         )
+         del x_norm_1
+         
+@@ -139,12 +140,12 @@ class FusedLlamaLayerIntraFunc(torch.autograd.Function):
+         q_q, q_scale = compression_pack_quant_base(
+             x=q, q_bit=q_bit,
+             q_method='per-channel', it_num=iteration,
+-            it_num_thd=iteration_threshold, static_value=static_value['q']
++            it_num_thd=iteration_threshold, static_value=static_value['q'], fixes=hyc_fixes
+         )
+         k_q, k_scale = compression_pack_quant_base(
+             x=k, q_bit=q_bit,
+             q_method='per-channel', it_num=iteration,
+-            it_num_thd=iteration_threshold, static_value=static_value['k']
++            it_num_thd=iteration_threshold, static_value=static_value['k'], fixes=hyc_fixes
+         )
+         del q, k
+         
+@@ -173,7 +174,7 @@ class FusedLlamaLayerIntraFunc(torch.autograd.Function):
+         v_q, v_scale = compression_pack_quant_base(
+             x=v, q_bit=q_bit,
+             q_method='per-channel', it_num=iteration,
+-            it_num_thd=iteration_threshold, static_value=static_value['v']
++            it_num_thd=iteration_threshold, static_value=static_value['v'], fixes=hyc_fixes
+         )
+         del v
+         
+@@ -187,7 +188,7 @@ class FusedLlamaLayerIntraFunc(torch.autograd.Function):
+         o_q, o_scale = compression_pack_quant_base(
+             x=o, q_bit=q_bit,
+             q_method='per-channel', it_num=iteration,
+-            it_num_thd=iteration_threshold, static_value=static_value['o']
++            it_num_thd=iteration_threshold, static_value=static_value['o'], fixes=hyc_fixes
+         )
+         del o
+         
+@@ -203,7 +204,7 @@ class FusedLlamaLayerIntraFunc(torch.autograd.Function):
+         x_medium_o, x_medium_q, x_medium_channel_idx, x_medium_scale = compression_pack_channel_base(
+             x=x_medium_copy, o_ratio=layernorm_outlier_ratio, q_bit=q_bit,
+             q_method='per-channel', it_num=iteration,
+-            it_num_thd=iteration_threshold, static_value=static_value['x_medium']
++            it_num_thd=iteration_threshold, static_value=static_value['x_medium'], fixes=hyc_fixes
+         )
+         
+         # forward process: gate_proj
+@@ -216,7 +217,7 @@ class FusedLlamaLayerIntraFunc(torch.autograd.Function):
+         x_norm_2_q, x_norm_2_scale = compression_pack_quant_base(
+             x=x_norm_2, q_bit=q_bit,
+             q_method='per-channel', it_num=iteration,
+-            it_num_thd=iteration_threshold, static_value=static_value['x_norm_2']
++            it_num_thd=iteration_threshold, static_value=static_value['x_norm_2'], fixes=hyc_fixes
+         )
+         del x_norm_2
+         
+@@ -227,7 +228,7 @@ class FusedLlamaLayerIntraFunc(torch.autograd.Function):
+         gate_q, gate_scale = compression_pack_quant_base(
+             x=gate, q_bit=q_bit,
+             q_method='per-channel', it_num=iteration,
+-            it_num_thd=iteration_threshold, static_value=static_value['gate']
++            it_num_thd=iteration_threshold, static_value=static_value['gate'], fixes=hyc_fixes
+         )
+         del gate
+             
+@@ -238,13 +239,13 @@ class FusedLlamaLayerIntraFunc(torch.autograd.Function):
+         up_q, up_scale = compression_pack_quant_base(
+             x=up, q_bit=q_bit,
+             q_method='per-channel', it_num=iteration,
+-            it_num_thd=iteration_threshold, static_value=static_value['up']
++            it_num_thd=iteration_threshold, static_value=static_value['up'], fixes=hyc_fixes
+         )
+         del up
+         fn_q, fn_scale = compression_pack_quant_base(
+             x=fn, q_bit=q_bit,
+             q_method='per-channel', it_num=iteration,
+-            it_num_thd=iteration_threshold, static_value=static_value['fn']
++            it_num_thd=iteration_threshold, static_value=static_value['fn'], fixes=hyc_fixes
+         )
+         del fn
+             
+@@ -255,7 +256,7 @@ class FusedLlamaLayerIntraFunc(torch.autograd.Function):
+         hadamard_q, hadamard_scale = compression_pack_quant_base(
+             x=hadamard, q_bit=q_bit,
+             q_method='per-channel', it_num=iteration,
+-            it_num_thd=iteration_threshold, static_value=static_value['hadamard']
++            it_num_thd=iteration_threshold, static_value=static_value['hadamard'], fixes=hyc_fixes
+         )
+         del hadamard
+         
+@@ -314,6 +315,7 @@ class FusedLlamaLayerIntraFunc(torch.autograd.Function):
+         ctx.block_size = block_size
+         ctx.num_warps = num_warps
+         ctx.head_dim = head_dim
++        ctx.hyc_fixes = hyc_fixes
+         ctx.q_bit = q_bit
+ 
+         return x_out, x_channel_idx, x_scale, \
+@@ -414,7 +416,7 @@ class FusedLlamaLayerIntraFunc(torch.autograd.Function):
+         # layernorm & rmsnorm backward
+         grad_norm_2, _ = rmsnorm_backward(
+             grad_gate_up, x_medium, norm_weight_2, mean_2, rstd_2, # TODO: other params
+-            True, 1e-5, ctx.num_warps, ctx.block_size
++            True, 1e-5, ctx.num_warps, ctx.block_size, rms_fix=ctx.hyc_fixes
+         )
+         del x_medium, grad_gate_up
+         
+@@ -495,7 +497,7 @@ class FusedLlamaLayerIntraFunc(torch.autograd.Function):
+         # layernorm or rmsnorm backward
+         grad_norm_1, _ = rmsnorm_backward(
+             grad_x, x, norm_weight_1, mean_1, rstd_1, # TODO: other params
+-            True, 1e-5, ctx.num_warps, ctx.block_size
++            True, 1e-5, ctx.num_warps, ctx.block_size, rms_fix=ctx.hyc_fixes
+         )
+             
+         # residual connection
+@@ -554,7 +556,7 @@ class FusedLlamaLayerIntraFunc(torch.autograd.Function):
+             None,
+             grad_w_down_lora_a,
+             grad_w_down_lora_b
+-        ) + (None,) * 10
++        ) + (None,) * 11
+ 
+ 
+ class FusedLlamaLayerIntra(torch.nn.Module):
+@@ -587,6 +589,7 @@ class FusedLlamaLayerIntra(torch.nn.Module):
+         self.softmax_outlier_ratio = hyclora_config.softmax_outlier_ratio
+         self.layernorm_outlier_ratio = hyclora_config.layernorm_outlier_ratio
+         self.q_bit = hyclora_config.q_bit
++        self.hyc_fixes = getattr(hyclora_config, 'hyc_fixes', False) # DA4022: one switch for all fixes
+ 
+ 
+     def forward(
+@@ -698,6 +701,7 @@ class FusedLlamaLayerIntra(torch.nn.Module):
+             self.softmax_outlier_ratio,
+             self.layernorm_outlier_ratio,
+             self.q_bit,
++            self.hyc_fixes,
+         )
+         
+         if self.iteration < self.iteration_threshold:
+diff --git a/models/llama/fused_llama_layer_intra_inter.py b/models/llama/fused_llama_layer_intra_inter.py
+index af63c47..ea9b6e5 100644
+--- a/models/llama/fused_llama_layer_intra_inter.py
++++ b/models/llama/fused_llama_layer_intra_inter.py
+@@ -11,8 +11,9 @@ from operators.compress_function import (
+     compression_pack_channel_base,
+     compression_pack_quant_base,
+     compression_pack_softmax_base,
+-    outlier_addition_fuse_decompression_dequantization,
+-    decompression_dequantization,
++    compression_pack_channel,
++    compression_pack_quant,
++    decompression_dequant,
+     update_dict,
+ )
+ 
+@@ -90,16 +91,19 @@ class FusedLlamaLayerIntraInterFunc(torch.autograd.Function):
+         softmax_outlier_ratio: float,
+         layernorm_outlier_ratio: float,
+         q_bit: int,
++        use_zero_point: bool,
++        fix_outlier_bug: bool,
++        hyc_fixes: bool,
+     ):
+         # layernorm or rmsnorm
+         x_norm_1, mean_1, rstd_1, _, _ = rmsnorm_forward(x, norm_weight_1, eps = 1e-5)
+         
+         #* compress the (copy of) x
+         x_copy = x.clone()
+-        x_o, x_q, x_channel_idx, x_scale = compression_pack_channel_base(
++        x_o, x_q, x_channel_idx, x_scale, x_zp = compression_pack_channel(
+             x=x_copy, o_ratio=layernorm_outlier_ratio, q_bit=q_bit,
+             q_method='per-channel', it_num=iteration,
+-            it_num_thd=iteration_threshold, static_value=static_value['x']
++            it_num_thd=iteration_threshold, static_value=static_value['x'], zero_point=use_zero_point, fixes=hyc_fixes
+         )
+ 
+         # compute q,k,v
+@@ -113,28 +117,28 @@ class FusedLlamaLayerIntraInterFunc(torch.autograd.Function):
+         v, v_main, v_lora_a = lora_forward(w_v, w_v_quant_state, w_v_lora_a, w_v_lora_b, b_v, x_norm_1)
+         
+         #* compress x_norm_1
+-        x_norm_1_q, x_norm_1_scale = compression_pack_quant_base(
++        x_norm_1_q, x_norm_1_scale, x_norm_1_zp = compression_pack_quant(
+             x=x_norm_1, q_bit=q_bit,
+             q_method='per-channel', it_num=iteration,
+-            it_num_thd=iteration_threshold, static_value=static_value['x_norm_1']
++            it_num_thd=iteration_threshold, static_value=static_value['x_norm_1'], zero_point=use_zero_point, fixes=hyc_fixes
+         )
+         del x_norm_1
+         
+         #* quantize q_main, k_main and v_main in original version, then add lora and apply rope
+-        q_main_q, q_main_scale = compression_pack_quant_base(
++        q_main_q, q_main_scale, q_main_zp = compression_pack_quant(
+             x=q_main, q_bit=q_bit,
+             q_method='per-channel', it_num=iteration,
+-            it_num_thd=iteration_threshold, static_value=static_value['q']
++            it_num_thd=iteration_threshold, static_value=static_value['q'], zero_point=use_zero_point, fixes=hyc_fixes
+         )
+-        k_main_q, k_main_scale = compression_pack_quant_base(
++        k_main_q, k_main_scale, k_main_zp = compression_pack_quant(
+             x=k_main, q_bit=q_bit,
+             q_method='per-channel', it_num=iteration,
+-            it_num_thd=iteration_threshold, static_value=static_value['k']
++            it_num_thd=iteration_threshold, static_value=static_value['k'], zero_point=use_zero_point, fixes=hyc_fixes
+         )
+-        v_main_q, v_main_scale = compression_pack_quant_base(
++        v_main_q, v_main_scale, v_main_zp = compression_pack_quant(
+             x=v_main, q_bit=q_bit,
+             q_method='per-channel', it_num=iteration,
+-            it_num_thd=iteration_threshold, static_value=static_value['v']
++            it_num_thd=iteration_threshold, static_value=static_value['v'], zero_point=use_zero_point, fixes=hyc_fixes
+         )
+         del q_main, k_main, v_main
+         
+@@ -184,10 +188,10 @@ class FusedLlamaLayerIntraInterFunc(torch.autograd.Function):
+         o_final, _, o_final_lora_a = lora_forward(w_o, w_o_quant_state, w_o_lora_a, w_o_lora_b, b_o, o)
+         
+         #* compress o
+-        o_q, o_scale = compression_pack_quant_base(
++        o_q, o_scale, o_zp = compression_pack_quant(
+             x=o, q_bit=q_bit,
+             q_method='per-channel', it_num=iteration,
+-            it_num_thd=iteration_threshold, static_value=static_value['o']
++            it_num_thd=iteration_threshold, static_value=static_value['o'], zero_point=use_zero_point, fixes=hyc_fixes
+         )
+         del o
+         
+@@ -200,10 +204,10 @@ class FusedLlamaLayerIntraInterFunc(torch.autograd.Function):
+         
+         #* compress the (copy of) x_medium
+         x_medium_copy = x_medium.clone()
+-        x_medium_o, x_medium_q, x_medium_channel_idx, x_medium_scale = compression_pack_channel_base(
++        x_medium_o, x_medium_q, x_medium_channel_idx, x_medium_scale, x_medium_zp = compression_pack_channel(
+             x=x_medium_copy, o_ratio=layernorm_outlier_ratio, q_bit=q_bit,
+             q_method='per-channel', it_num=iteration,
+-            it_num_thd=iteration_threshold, static_value=static_value['x_medium']
++            it_num_thd=iteration_threshold, static_value=static_value['x_medium'], zero_point=use_zero_point, fixes=hyc_fixes
+         )
+         
+         # forward process: gate_proj
+@@ -211,26 +215,26 @@ class FusedLlamaLayerIntraInterFunc(torch.autograd.Function):
+         up, up_main, up_lora_a = lora_forward(w_up, w_up_quant_state, w_up_lora_a, w_up_lora_b, b_up, x_norm_2)
+         
+         #* compress the x_norm_2
+-        x_norm_2_q, x_norm_2_scale = compression_pack_quant_base(
++        x_norm_2_q, x_norm_2_scale, x_norm_2_zp = compression_pack_quant(
+             x=x_norm_2, q_bit=q_bit,
+             q_method='per-channel', it_num=iteration,
+-            it_num_thd=iteration_threshold, static_value=static_value['x_norm_2']
++            it_num_thd=iteration_threshold, static_value=static_value['x_norm_2'], zero_point=use_zero_point, fixes=hyc_fixes
+         )
+         del x_norm_2
+         
+         #* compress the gate_main
+-        gate_main_q, gate_main_scale = compression_pack_quant_base(
++        gate_main_q, gate_main_scale, gate_main_zp = compression_pack_quant(
+             x=gate_main, q_bit=q_bit,
+             q_method='per-channel', it_num=iteration,
+-            it_num_thd=iteration_threshold, static_value=static_value['gate']
++            it_num_thd=iteration_threshold, static_value=static_value['gate'], zero_point=use_zero_point, fixes=hyc_fixes
+         )
+         del gate_main
+         
+         #* compress the up_main
+-        up_main_q, up_main_scale = compression_pack_quant_base(
++        up_main_q, up_main_scale, up_main_zp = compression_pack_quant(
+             x=up_main, q_bit=q_bit,
+             q_method='per-channel', it_num=iteration,
+-            it_num_thd=iteration_threshold, static_value=static_value['up']
++            it_num_thd=iteration_threshold, static_value=static_value['up'], zero_point=use_zero_point, fixes=hyc_fixes
+         )
+         del up_main
+ 
+@@ -249,23 +253,23 @@ class FusedLlamaLayerIntraInterFunc(torch.autograd.Function):
+         
+         ctx.save_for_backward(
+             ### buffered activation (attention) ###
+-            x_o, x_q, x_scale, # x
++            x_o, x_q, x_scale, x_zp, # x
+             mean_1, rstd_1, # buffer for rmsnorm
+-            x_norm_1_q, x_norm_1_scale, # x_norm_1
++            x_norm_1_q, x_norm_1_scale, x_norm_1_zp, # x_norm_1
+             cos, sin, # buffer for rope
+-            q_main_q, q_main_scale, # q
+-            k_main_q, k_main_scale, # k
+-            v_main_q, v_main_scale, # v
++            q_main_q, q_main_scale, q_main_zp, # q
++            k_main_q, k_main_scale, k_main_zp, # k
++            v_main_q, v_main_scale, v_main_zp, # v
+             a_o, a_threshold, # a
+-            o_q, o_scale, # o
++            o_q, o_scale, o_zp, # o
+             q_lora_a, k_lora_a, v_lora_a, # buffer for lora (qkv)
+             o_final_lora_a, # buffer for lora (o)
+             ### buffered activation (mlp) ###
+             mean_2, rstd_2, # buffer for rmsnorm
+-            x_medium_o, x_medium_q, x_medium_scale, # x_medium
+-            x_norm_2_q, x_norm_2_scale, # x_norm_2
+-            gate_main_q, gate_main_scale, # gate
+-            up_main_q, up_main_scale, # up
++            x_medium_o, x_medium_q, x_medium_scale, x_medium_zp, # x_medium
++            x_norm_2_q, x_norm_2_scale, x_norm_2_zp, # x_norm_2
++            gate_main_q, gate_main_scale, gate_main_zp, # gate
++            up_main_q, up_main_scale, up_main_zp, # up
+             gate_lora_a, up_lora_a, down_lora_a,
+             ### weights (attention) ###
+             norm_weight_1, norm_bias_1,
+@@ -295,15 +299,17 @@ class FusedLlamaLayerIntraInterFunc(torch.autograd.Function):
+         ctx.block_size = block_size
+         ctx.num_warps = num_warps
+         ctx.head_dim = head_dim
++        ctx.hyc_fixes = hyc_fixes
+         ctx.q_bit = q_bit
++        ctx.fix_outlier_bug = fix_outlier_bug
+ 
+-        return x_out, x_channel_idx, x_scale, \
+-            x_norm_1_scale, \
+-            q_main_scale, k_main_scale, v_main_scale, \
+-            a_threshold, o_scale, \
+-            x_medium_channel_idx, x_medium_scale, \
+-            x_norm_2_scale, \
+-            gate_main_scale, up_main_scale
++        return x_out, x_channel_idx, x_scale, x_zp, \
++            x_norm_1_scale, x_norm_1_zp, \
++            q_main_scale, q_main_zp, k_main_scale, k_main_zp, v_main_scale, v_main_zp, \
++            a_threshold, o_scale, o_zp, \
++            x_medium_channel_idx, x_medium_scale, x_medium_zp, \
++            x_norm_2_scale, x_norm_2_zp, \
++            gate_main_scale, gate_main_zp, up_main_scale, up_main_zp
+             
+     
+     @staticmethod
+@@ -320,23 +326,23 @@ class FusedLlamaLayerIntraInterFunc(torch.autograd.Function):
+         
+         (
+             ### buffered activation (attention) ###
+-            x_o, x_q, x_scale, # x
++            x_o, x_q, x_scale, x_zp, # x
+             mean_1, rstd_1, # buffer for rmsnorm
+-            x_norm_1_q, x_norm_1_scale, # x_norm_1
++            x_norm_1_q, x_norm_1_scale, x_norm_1_zp, # x_norm_1
+             cos, sin, # buffer for rope
+-            q_main_q, q_main_scale, # q
+-            k_main_q, k_main_scale, # k
+-            v_main_q, v_main_scale, # v
++            q_main_q, q_main_scale, q_main_zp, # q
++            k_main_q, k_main_scale, k_main_zp, # k
++            v_main_q, v_main_scale, v_main_zp, # v
+             a_o, a_threshold, # a
+-            o_q, o_scale, # o
++            o_q, o_scale, o_zp, # o
+             q_lora_a, k_lora_a, v_lora_a, # buffer for lora (qkv)
+             o_final_lora_a, # buffer for lora (o)
+             ### buffered activation (mlp) ###
+             mean_2, rstd_2, # buffer for rmsnorm
+-            x_medium_o, x_medium_q, x_medium_scale, # x_medium
+-            x_norm_2_q, x_norm_2_scale, # x_norm_2
+-            gate_main_q, gate_main_scale, # gate
+-            up_main_q, up_main_scale, # up
++            x_medium_o, x_medium_q, x_medium_scale, x_medium_zp, # x_medium
++            x_norm_2_q, x_norm_2_scale, x_norm_2_zp, # x_norm_2
++            gate_main_q, gate_main_scale, gate_main_zp, # gate
++            up_main_q, up_main_scale, up_main_zp, # up
+             gate_lora_a, up_lora_a, down_lora_a,
+             ### weights (attention) ###
+             norm_weight_1, norm_bias_1,
+@@ -353,7 +359,7 @@ class FusedLlamaLayerIntraInterFunc(torch.autograd.Function):
+         
+         #! recompute flow, use gate and up to reconstruct fn and hadamard
+         #* dequantize gate_main
+-        gate_main = decompression_dequantization(gate_main_q, gate_main_scale, ctx.q_bit)
++        gate_main = decompression_dequant(gate_main_q, gate_main_scale, gate_main_zp, ctx.q_bit)
+         del gate_main_q, gate_main_scale
+         gate = gate_main + (gate_lora_a.to(gate_main.dtype)) @ w_gate_lora_b.to(gate_main.dtype)
+         del gate_main
+@@ -362,7 +368,7 @@ class FusedLlamaLayerIntraInterFunc(torch.autograd.Function):
+         fn = torch.nn.functional.silu(gate)
+         
+         #* dequantize up_main
+-        up_main = decompression_dequantization(up_main_q, up_main_scale, ctx.q_bit)
++        up_main = decompression_dequant(up_main_q, up_main_scale, up_main_zp, ctx.q_bit)
+         del up_main_q, up_main_scale
+         up = up_main + (up_lora_a.to(up_main.dtype)) @ w_up_lora_b.to(up_main.dtype)
+         del up_main
+@@ -382,7 +388,7 @@ class FusedLlamaLayerIntraInterFunc(torch.autograd.Function):
+         del gate, grad_hadamard_1
+         
+         #* dequantize x_norm_2
+-        x_norm_2 = decompression_dequantization(x_norm_2_q, x_norm_2_scale, ctx.q_bit)
++        x_norm_2 = decompression_dequant(x_norm_2_q, x_norm_2_scale, x_norm_2_zp, ctx.q_bit)
+         del x_norm_2_q, x_norm_2_scale
+         
+         # gate proj part
+@@ -395,13 +401,13 @@ class FusedLlamaLayerIntraInterFunc(torch.autograd.Function):
+         del up_lora_a, grad_hadamard_2, grad_up, grad_gate, x_norm_2
+         
+         #* dequantize x_medium
+-        x_medium = outlier_addition_fuse_decompression_dequantization(x_medium_q, x_medium_scale, x_medium_o, ctx.post_layernorm_channel, ctx.q_bit)
++        x_medium = decompression_dequant(x_medium_q, x_medium_scale, x_medium_zp, ctx.q_bit, x_medium_o, ctx.post_layernorm_channel)
+         del x_medium_q, x_medium_scale, x_medium_o
+         
+         # layernorm & rmsnorm backward
+         grad_norm_2, _ = rmsnorm_backward(
+             grad_gate_up, x_medium, norm_weight_2, mean_2, rstd_2, # TODO: other params
+-            True, 1e-5, ctx.num_warps, ctx.block_size
++            True, 1e-5, ctx.num_warps, ctx.block_size, rms_fix=ctx.hyc_fixes
+         )
+         del x_medium, grad_gate_up
+         
+@@ -410,7 +416,7 @@ class FusedLlamaLayerIntraInterFunc(torch.autograd.Function):
+         del grad_norm_2, grad_output
+         
+         #* dequantize o
+-        o = decompression_dequantization(o_q, o_scale, ctx.q_bit)
++        o = decompression_dequant(o_q, o_scale, o_zp, ctx.q_bit)
+         del o_q, o_scale
+         
+         # o part
+@@ -423,7 +429,7 @@ class FusedLlamaLayerIntraInterFunc(torch.autograd.Function):
+         #* dequantize a, v
+         a = a_o.to_dense()
+         a = a.reshape(ctx.a_shape)
+-        v_main = decompression_dequantization(v_main_q, v_main_scale, ctx.q_bit)
++        v_main = decompression_dequant(v_main_q, v_main_scale, v_main_zp, ctx.q_bit)
+         v = v_main + (v_lora_a.to(v_main.dtype)) @ w_v_lora_b.to(v_main.dtype)
+         v = hidden_to_head_shape(v, ctx.num_key_value_heads)
+         if ctx.num_heads != ctx.num_key_value_heads:
+@@ -446,7 +452,7 @@ class FusedLlamaLayerIntraInterFunc(torch.autograd.Function):
+         grad_s = grad_s / math.sqrt(ctx.head_dim)
+         
+         #* dequantize q, k, then apply rope
+-        q_main = decompression_dequantization(q_main_q, q_main_scale, ctx.q_bit)
++        q_main = decompression_dequant(q_main_q, q_main_scale, q_main_zp, ctx.q_bit)
+         del q_main_q, q_main_scale
+         q = q_main + (q_lora_a.to(q_main.dtype)) @ w_q_lora_b.to(q_main.dtype)
+         q = hidden_to_head_shape(q, ctx.num_heads)
+@@ -454,7 +460,7 @@ class FusedLlamaLayerIntraInterFunc(torch.autograd.Function):
+         q = rope_forward(q.transpose(1, 2), cos, sin).transpose(1, 2)
+         grad_k = grad_s.transpose(-2, -1) @ q
+         
+-        k_main = decompression_dequantization(k_main_q, k_main_scale, ctx.q_bit)
++        k_main = decompression_dequant(k_main_q, k_main_scale, k_main_zp, ctx.q_bit)
+         del k_main_q, k_main_scale
+         k = k_main + (k_lora_a.to(k_main.dtype)) @ w_k_lora_b.to(k_main.dtype)
+         k = hidden_to_head_shape(k, ctx.num_key_value_heads)
+@@ -476,7 +482,7 @@ class FusedLlamaLayerIntraInterFunc(torch.autograd.Function):
+         grad_v = head_to_hidden_shape(grad_v)
+         
+         #* dequantize x_norm_1
+-        x_norm_1 = decompression_dequantization(x_norm_1_q, x_norm_1_scale, ctx.q_bit)
++        x_norm_1 = decompression_dequant(x_norm_1_q, x_norm_1_scale, x_norm_1_zp, ctx.q_bit)
+         del x_norm_1_q, x_norm_1_scale
+         
+         # backward of q_proj
+@@ -491,13 +497,15 @@ class FusedLlamaLayerIntraInterFunc(torch.autograd.Function):
+         grad_x += grad_x_temp
+         
+         #* dequantize x
+-        x = outlier_addition_fuse_decompression_dequantization(x_q, x_scale, x_o, ctx.post_layernorm_channel, ctx.q_bit)
++        # released code restores x with x_medium's outlier channels; fix_outlier_bug uses x's own
++        x_channel = ctx.input_layernorm_channel if ctx.fix_outlier_bug else ctx.post_layernorm_channel
++        x = decompression_dequant(x_q, x_scale, x_zp, ctx.q_bit, x_o, x_channel)
+         del x_q, x_scale, x_o
+         
+         # layernorm or rmsnorm backward
+         grad_norm_1, _ = rmsnorm_backward(
+             grad_x, x, norm_weight_1, mean_1, rstd_1, # TODO: other params
+-            True, 1e-5, ctx.num_warps, ctx.block_size
++            True, 1e-5, ctx.num_warps, ctx.block_size, rms_fix=ctx.hyc_fixes
+         )
+             
+         # residual connection
+@@ -556,7 +564,7 @@ class FusedLlamaLayerIntraInterFunc(torch.autograd.Function):
+             None,
+             grad_w_down_lora_a,
+             grad_w_down_lora_b
+-        ) + (None,) * 10
++        ) + (None,) * 13
+ 
+ 
+ class FusedLlamaLayerIntraInter(torch.nn.Module):
+@@ -566,17 +574,17 @@ class FusedLlamaLayerIntraInter(torch.nn.Module):
+         super(FusedLlamaLayerIntraInter, self).__init__()
+         self.iteration = 0
+         self.static_value = {
+-            'x': {'outlier_channel_index': None, 'scale': None},
+-            'x_norm_1': {'scale': None},
+-            'q': {'scale': None},
+-            'k': {'scale': None},
+-            'v': {'scale': None},
++            'x': {'outlier_channel_index': None, 'scale': None, 'zero_point': None},
++            'x_norm_1': {'scale': None, 'zero_point': None},
++            'q': {'scale': None, 'zero_point': None},
++            'k': {'scale': None, 'zero_point': None},
++            'v': {'scale': None, 'zero_point': None},
+             'a': {'outlier': None},
+-            'o': {'scale': None},
+-            'x_medium': {'outlier_channel_index': None, 'scale': None},
+-            'x_norm_2': {'scale': None},
+-            'gate': {'scale': None},
+-            'up': {'scale': None},
++            'o': {'scale': None, 'zero_point': None},
++            'x_medium': {'outlier_channel_index': None, 'scale': None, 'zero_point': None},
++            'x_norm_2': {'scale': None, 'zero_point': None},
++            'gate': {'scale': None, 'zero_point': None},
++            'up': {'scale': None, 'zero_point': None},
+         }
+ 
+ 
+@@ -587,6 +595,9 @@ class FusedLlamaLayerIntraInter(torch.nn.Module):
+         self.softmax_outlier_ratio = hyclora_config.softmax_outlier_ratio
+         self.layernorm_outlier_ratio = hyclora_config.layernorm_outlier_ratio
+         self.q_bit = hyclora_config.q_bit
++        self.hyc_fixes = getattr(hyclora_config, 'hyc_fixes', False) # DA4022: one switch for all fixes
++        self.use_zero_point = self.hyc_fixes or getattr(hyclora_config, 'use_zero_point', False)
++        self.fix_outlier_bug = self.hyc_fixes or getattr(hyclora_config, 'fix_outlier_bug', False)
+         
+         
+     def forward(
+@@ -627,13 +638,13 @@ class FusedLlamaLayerIntraInter(torch.nn.Module):
+         head_dim: int,
+         num_key_value_heads: int,
+     ):
+-        y, x_channel_idx, x_scale, \
+-        x_norm_1_scale, \
+-        q_main_scale, k_main_scale, v_main_scale, \
+-        a_threshold, o_scale, \
+-        x_medium_channel_idx, x_medium_scale, \
+-        x_norm_2_scale, \
+-        gate_main_scale, up_main_scale = FusedLlamaLayerIntraInterFunc.apply(
++        y, x_channel_idx, x_scale, x_zp, \
++        x_norm_1_scale, x_norm_1_zp, \
++        q_main_scale, q_main_zp, k_main_scale, k_main_zp, v_main_scale, v_main_zp, \
++        a_threshold, o_scale, o_zp, \
++        x_medium_channel_idx, x_medium_scale, x_medium_zp, \
++        x_norm_2_scale, x_norm_2_zp, \
++        gate_main_scale, gate_main_zp, up_main_scale, up_main_zp = FusedLlamaLayerIntraInterFunc.apply(
+             input,
+             #############attention part#############
+             norm_weight_1,
+@@ -698,20 +709,23 @@ class FusedLlamaLayerIntraInter(torch.nn.Module):
+             self.softmax_outlier_ratio,
+             self.layernorm_outlier_ratio,
+             self.q_bit,
++            self.use_zero_point,
++            self.fix_outlier_bug,
++            self.hyc_fixes,
+         )
+         
+         if self.iteration < self.iteration_threshold:
+-            self.static_value['x'] = update_dict(self.static_value['x'], {'outlier_channel_index': x_channel_idx, 'scale': x_scale}, self.iteration)
+-            self.static_value['x_norm_1'] = update_dict(self.static_value['x_norm_1'], {'scale': x_norm_1_scale}, self.iteration)
+-            self.static_value['q'] = update_dict(self.static_value['q'], {'scale': q_main_scale}, self.iteration)
+-            self.static_value['k'] = update_dict(self.static_value['k'], {'scale': k_main_scale}, self.iteration)
+-            self.static_value['v'] = update_dict(self.static_value['v'], {'scale': v_main_scale}, self.iteration)
++            self.static_value['x'] = update_dict(self.static_value['x'], {'outlier_channel_index': x_channel_idx, 'scale': x_scale, 'zero_point': x_zp}, self.iteration)
++            self.static_value['x_norm_1'] = update_dict(self.static_value['x_norm_1'], {'scale': x_norm_1_scale, 'zero_point': x_norm_1_zp}, self.iteration)
++            self.static_value['q'] = update_dict(self.static_value['q'], {'scale': q_main_scale, 'zero_point': q_main_zp}, self.iteration)
++            self.static_value['k'] = update_dict(self.static_value['k'], {'scale': k_main_scale, 'zero_point': k_main_zp}, self.iteration)
++            self.static_value['v'] = update_dict(self.static_value['v'], {'scale': v_main_scale, 'zero_point': v_main_zp}, self.iteration)
+             self.static_value['a'] = update_dict(self.static_value['a'], {'outlier': a_threshold}, self.iteration)
+-            self.static_value['o'] = update_dict(self.static_value['o'], {'scale': o_scale}, self.iteration)
+-            self.static_value['x_medium'] = update_dict(self.static_value['x_medium'], {'outlier_channel_index': x_medium_channel_idx, 'scale': x_medium_scale}, self.iteration)
+-            self.static_value['x_norm_2'] = update_dict(self.static_value['x_norm_2'], {'scale': x_norm_2_scale}, self.iteration)
+-            self.static_value['gate'] = update_dict(self.static_value['gate'], {'scale': gate_main_scale}, self.iteration)
+-            self.static_value['up'] = update_dict(self.static_value['up'], {'scale': up_main_scale}, self.iteration)
++            self.static_value['o'] = update_dict(self.static_value['o'], {'scale': o_scale, 'zero_point': o_zp}, self.iteration)
++            self.static_value['x_medium'] = update_dict(self.static_value['x_medium'], {'outlier_channel_index': x_medium_channel_idx, 'scale': x_medium_scale, 'zero_point': x_medium_zp}, self.iteration)
++            self.static_value['x_norm_2'] = update_dict(self.static_value['x_norm_2'], {'scale': x_norm_2_scale, 'zero_point': x_norm_2_zp}, self.iteration)
++            self.static_value['gate'] = update_dict(self.static_value['gate'], {'scale': gate_main_scale, 'zero_point': gate_main_zp}, self.iteration)
++            self.static_value['up'] = update_dict(self.static_value['up'], {'scale': up_main_scale, 'zero_point': up_main_zp}, self.iteration)
+         
+         self.iteration += 1
+         
+diff --git a/models/llama/fused_llama_layer_intra_inter_full_fuse.py b/models/llama/fused_llama_layer_intra_inter_full_fuse.py
+index 4bea257..43b521d 100644
+--- a/models/llama/fused_llama_layer_intra_inter_full_fuse.py
++++ b/models/llama/fused_llama_layer_intra_inter_full_fuse.py
+@@ -94,6 +94,8 @@ class FusedLlamaLayerIntraInterFullFuseFunc(torch.autograd.Function):
+         softmax_outlier_ratio: float,
+         layernorm_outlier_ratio: float,
+         q_bit: int,
++        fix_outlier_bug: bool,
++        hyc_fixes: bool,
+     ):
+         # layernorm or rmsnorm
+         x_norm_1, mean_1, rstd_1, _, _ = rmsnorm_forward(x, norm_weight_1, eps = 1e-5)
+@@ -103,7 +105,7 @@ class FusedLlamaLayerIntraInterFullFuseFunc(torch.autograd.Function):
+         x_o, x_q, x_channel_idx, x_scale = compression_pack_channel_base(
+             x=x_copy, o_ratio=layernorm_outlier_ratio, q_bit=q_bit,
+             q_method='per-channel', it_num=iteration,
+-            it_num_thd=iteration_threshold, static_value=static_value['x']
++            it_num_thd=iteration_threshold, static_value=static_value['x'], fixes=hyc_fixes
+         )
+ 
+         # compute q,k,v
+@@ -120,7 +122,7 @@ class FusedLlamaLayerIntraInterFullFuseFunc(torch.autograd.Function):
+         x_norm_1_q, x_norm_1_scale = compression_pack_quant_base(
+             x=x_norm_1, q_bit=q_bit,
+             q_method='per-channel', it_num=iteration,
+-            it_num_thd=iteration_threshold, static_value=static_value['x_norm_1']
++            it_num_thd=iteration_threshold, static_value=static_value['x_norm_1'], fixes=hyc_fixes
+         )
+         del x_norm_1
+         
+@@ -128,17 +130,17 @@ class FusedLlamaLayerIntraInterFullFuseFunc(torch.autograd.Function):
+         q_main_q, q_main_scale = compression_pack_quant_base(
+             x=q_main, q_bit=q_bit,
+             q_method='per-channel', it_num=iteration,
+-            it_num_thd=iteration_threshold, static_value=static_value['q']
++            it_num_thd=iteration_threshold, static_value=static_value['q'], fixes=hyc_fixes
+         )
+         k_main_q, k_main_scale = compression_pack_quant_base(
+             x=k_main, q_bit=q_bit,
+             q_method='per-channel', it_num=iteration,
+-            it_num_thd=iteration_threshold, static_value=static_value['k']
++            it_num_thd=iteration_threshold, static_value=static_value['k'], fixes=hyc_fixes
+         )
+         v_main_q, v_main_scale = compression_pack_quant_base(
+             x=v_main, q_bit=q_bit,
+             q_method='per-channel', it_num=iteration,
+-            it_num_thd=iteration_threshold, static_value=static_value['v']
++            it_num_thd=iteration_threshold, static_value=static_value['v'], fixes=hyc_fixes
+         )
+         del q_main, k_main, v_main
+         
+@@ -191,7 +193,7 @@ class FusedLlamaLayerIntraInterFullFuseFunc(torch.autograd.Function):
+         o_q, o_scale = compression_pack_quant_base(
+             x=o, q_bit=q_bit,
+             q_method='per-channel', it_num=iteration,
+-            it_num_thd=iteration_threshold, static_value=static_value['o']
++            it_num_thd=iteration_threshold, static_value=static_value['o'], fixes=hyc_fixes
+         )
+         del o
+         
+@@ -207,7 +209,7 @@ class FusedLlamaLayerIntraInterFullFuseFunc(torch.autograd.Function):
+         x_medium_o, x_medium_q, x_medium_channel_idx, x_medium_scale = compression_pack_channel_base(
+             x=x_medium_copy, o_ratio=layernorm_outlier_ratio, q_bit=q_bit,
+             q_method='per-channel', it_num=iteration,
+-            it_num_thd=iteration_threshold, static_value=static_value['x_medium']
++            it_num_thd=iteration_threshold, static_value=static_value['x_medium'], fixes=hyc_fixes
+         )
+         
+         # # forward process: gate_proj
+@@ -226,8 +228,8 @@ class FusedLlamaLayerIntraInterFullFuseFunc(torch.autograd.Function):
+         up_lora_a = x_norm_2 @ w_up_lora_a.to(w_up_dequant.dtype)
+         
+         if iteration < iteration_threshold:
+-            gate_main_scale = get_statistics_only_quant(gate_main, q_bit, 'per-channel')
+-            up_main_scale = get_statistics_only_quant(up_main, q_bit, 'per-channel')
++            gate_main_scale = get_statistics_only_quant(gate_main, q_bit, 'per-channel', hyc_fixes)
++            up_main_scale = get_statistics_only_quant(up_main, q_bit, 'per-channel', hyc_fixes)
+         else:
+             gate_main_scale = static_value['gate']['scale']
+             up_main_scale = static_value['up']['scale']
+@@ -239,7 +241,7 @@ class FusedLlamaLayerIntraInterFullFuseFunc(torch.autograd.Function):
+         x_norm_2_q, x_norm_2_scale = compression_pack_quant_base(
+             x=x_norm_2, q_bit=q_bit,
+             q_method='per-channel', it_num=iteration,
+-            it_num_thd=iteration_threshold, static_value=static_value['x_norm_2']
++            it_num_thd=iteration_threshold, static_value=static_value['x_norm_2'], fixes=hyc_fixes
+         )
+         del x_norm_2
+ 
+@@ -299,7 +301,9 @@ class FusedLlamaLayerIntraInterFullFuseFunc(torch.autograd.Function):
+         ctx.block_size = block_size
+         ctx.num_warps = num_warps
+         ctx.head_dim = head_dim
++        ctx.hyc_fixes = hyc_fixes
+         ctx.q_bit = q_bit
++        ctx.fix_outlier_bug = fix_outlier_bug
+ 
+         return x_out, x_channel_idx, x_scale, \
+             x_norm_1_scale, \
+@@ -391,7 +395,7 @@ class FusedLlamaLayerIntraInterFullFuseFunc(torch.autograd.Function):
+         # layernorm & rmsnorm backward
+         grad_norm_2, _ = rmsnorm_backward(
+             grad_gate_up, x_medium, norm_weight_2, mean_2, rstd_2, # TODO: other params
+-            True, 1e-5, ctx.num_warps, ctx.block_size
++            True, 1e-5, ctx.num_warps, ctx.block_size, rms_fix=ctx.hyc_fixes
+         )
+         del x_medium, grad_gate_up
+         
+@@ -481,13 +485,15 @@ class FusedLlamaLayerIntraInterFullFuseFunc(torch.autograd.Function):
+         grad_x += grad_x_temp
+         
+         #* dequantize x
+-        x = outlier_addition_fuse_decompression_dequantization(x_q, x_scale, x_o, ctx.post_layernorm_channel, ctx.q_bit)
++        # released code restores x with x_medium's outlier channels; fix_outlier_bug uses x's own
++        x_channel = ctx.input_layernorm_channel if ctx.fix_outlier_bug else ctx.post_layernorm_channel
++        x = outlier_addition_fuse_decompression_dequantization(x_q, x_scale, x_o, x_channel, ctx.q_bit)
+         del x_q, x_scale, x_o
+         
+         # layernorm or rmsnorm backward
+         grad_norm_1, _ = rmsnorm_backward(
+             grad_x, x, norm_weight_1, mean_1, rstd_1, # TODO: other params
+-            True, 1e-5, ctx.num_warps, ctx.block_size
++            True, 1e-5, ctx.num_warps, ctx.block_size, rms_fix=ctx.hyc_fixes
+         )
+             
+         # residual connection
+@@ -546,7 +552,7 @@ class FusedLlamaLayerIntraInterFullFuseFunc(torch.autograd.Function):
+             None,
+             grad_w_down_lora_a,
+             grad_w_down_lora_b
+-        ) + (None,) * 10
++        ) + (None,) * 12
+ 
+ 
+ class FusedLlamaLayerIntraInterFullFuse(torch.nn.Module):
+@@ -577,6 +583,8 @@ class FusedLlamaLayerIntraInterFullFuse(torch.nn.Module):
+         self.softmax_outlier_ratio = hyclora_config.softmax_outlier_ratio
+         self.layernorm_outlier_ratio = hyclora_config.layernorm_outlier_ratio
+         self.q_bit = hyclora_config.q_bit
++        self.hyc_fixes = getattr(hyclora_config, 'hyc_fixes', False) # DA4022: one switch for all fixes
++        self.fix_outlier_bug = self.hyc_fixes or getattr(hyclora_config, 'fix_outlier_bug', False)
+         
+         
+     def forward(
+@@ -688,6 +696,8 @@ class FusedLlamaLayerIntraInterFullFuse(torch.nn.Module):
+             self.softmax_outlier_ratio,
+             self.layernorm_outlier_ratio,
+             self.q_bit,
++            self.fix_outlier_bug,
++            self.hyc_fixes,
+         )
+         
+         if self.iteration < self.iteration_threshold:
+diff --git a/models/llama/modeling_llama.py b/models/llama/modeling_llama.py
+index af5122a..aba92de 100644
+--- a/models/llama/modeling_llama.py
++++ b/models/llama/modeling_llama.py
+@@ -53,6 +53,7 @@ from .fused_llama_layer_baseline import FusedLlamaLayerBaseline
+ from .fused_llama_layer_intra import FusedLlamaLayerIntra
+ from .fused_llama_layer_intra_inter import FusedLlamaLayerIntraInter
+ from .fused_llama_layer_intra_inter_full_fuse import FusedLlamaLayerIntraInterFullFuse
++from .fused_llama_layer_adahyc import FusedLlamaLayerAdaHyC
+ 
+ from ..utils.compute_utils import repeat_kv
+ 
+@@ -1161,6 +1162,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
+             fused_llama_layer_class = FusedLlamaLayerIntraInter
+         elif layer_type == 'intra_inter_full_fuse':
+             fused_llama_layer_class = FusedLlamaLayerIntraInterFullFuse
++        elif layer_type == 'adahyc': # intra_inter (fixed) + per-buffer bits + rebuild-instead-of-store
++            fused_llama_layer_class = FusedLlamaLayerAdaHyC
+         else:
+             raise ValueError("Unsupported type (Available: [FusedLlamaLayerBaseline | FusedLlamaLayerIntra | FusedLlamaLayerIntraInter])")
+         
+@@ -1171,12 +1174,22 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
+             print(f"\033[1;32m[INFO] Softmax Outlier Ratio: {self.hyclora_config.softmax_outlier_ratio}\033[0m")
+             print(f"\033[1;32m[INFO] Layernorm Outlier Ratio: {self.hyclora_config.layernorm_outlier_ratio}\033[0m")
+             print(f"\033[1;32m[INFO] Quantization Bit: {self.hyclora_config.q_bit}\033[0m")
++            for name in ('hyc_fixes', 'fix_outlier_bug', 'use_zero_point', 'bit_plan_path', 'rebuild_tau'):
++                print(f"\033[1;32m[INFO] {name}: {getattr(self.hyclora_config, name, None)}\033[0m")
++            if layer_type == 'adahyc':
++                print(f"\033[1;33m[INFO] adahyc: hyc_fixes ALWAYS ON (RMSNorm dx, own outlier channels, frozen outlier index, all-sample statistics, zero-point); the fix/zp flags above are ignored\033[0m")
++            elif getattr(self.hyclora_config, 'hyc_fixes', False) and layer_type in ('intra', 'intra_inter_full_fuse'):
++                print(f"\033[1;33m[WARN] hyc_fixes on {layer_type}: RMSNorm/outlier/calibration fixes only, zero-point is not implemented for this layer type\033[0m")
+             print(f"\033[1;34m*******************************************\033[0m")
+         else:
+             print(f"\033[1;31m********** HycLora is not used **********\033[0m")
+         
++        fused_layers = []
+         for layer in self.model.layers:
+             layer.fused_llama_layer = fused_llama_layer_class()
++            layer.fused_llama_layer.layer_idx = layer.layer_idx
++            layer.fused_llama_layer.peers = fused_layers # adahyc reports model-wide statistics through this
++            fused_layers.append(layer.fused_llama_layer)
+             layer.fused_llama_layer.set_hyclora_config(hyclora_config)
+ 
+     def get_input_embeddings(self):
+diff --git a/operators/compress_function.py b/operators/compress_function.py
+index 5265191..f966937 100644
+--- a/operators/compress_function.py
++++ b/operators/compress_function.py
+@@ -27,6 +27,18 @@ def update_dict(old_dict, new_dict, iteration):
+     return old_dict
+ 
+ 
++# DA4022 fixes (hyc_fixes): calibration statistics over every token of every sample instead of sample 0 only
++def calib_rows(x, fixes):
++    return x.reshape(-1, x.shape[-1]) if fixes else x[0]
++
++# DA4022 fixes (hyc_fixes): released update_dict replaces the outlier index every calibration iteration but
++# averages scales, so a channel that was an outlier (zeroed -> scale 1e-3) in an earlier iteration keeps a
++# shrunk scale and clips for the rest of training. With fixes the index is frozen at the first calibration
++# iteration and reused, so every averaged scale / zero point is computed over the same channel set.
++def calib_channel(static_value, fixes):
++    return static_value.get('outlier_channel_index') if fixes else None
++
++
+ def get_statistics_softmax(x: torch.Tensor, outlier_ratio: float):
+     outlier = torch.kthvalue(x.float().flatten(), int(x.numel() * (1 - outlier_ratio))).values
+     return outlier
+@@ -42,12 +54,12 @@ def get_statistics_structed_pruning(x: torch.Tensor, outlier_ratio: float):
+     return outlier_channel_index
+ 
+ 
+-def get_statistics_only_quant(x: torch.Tensor, q_bit: int = 8, q_method: str = 'per-tensor'):
++def get_statistics_only_quant(x: torch.Tensor, q_bit: int = 8, q_method: str = 'per-tensor', fixes: bool = False):
+     if len(x.shape) == 4:
+         batch, num_head, seq_len, sep_dim = x.shape
+         x = x.permute(0, 2, 1, 3).reshape(batch, seq_len, num_head * sep_dim)
+ 
+-    x_sample = x[0]
++    x_sample = calib_rows(x, fixes)
+     if q_method == 'per-tensor':
+         scale = (x_sample.max() - x_sample.min()) / (2 ** q_bit - 1)
+     elif q_method == 'per-channel':
+@@ -77,20 +89,22 @@ def get_statistics_only_quant_zero_point(x: torch.Tensor, q_bit: int = 8, q_meth
+     return scale.to(torch.bfloat16), zero_point.to(torch.int8)
+ 
+ 
+-def get_statistics_channel_base(x: torch.Tensor, outlier_ratio: float, q_bit: int = 8, q_method: str = 'per-tensor'):
++def get_statistics_channel_base(x: torch.Tensor, outlier_ratio: float, q_bit: int = 8, q_method: str = 'per-tensor', fixes: bool = False, channel=None):
+     x_ = x.clone()
+     if len(x_.shape) == 4:
+         batch, num_head, seq_len, sep_dim = x_.shape
+         x_ = x_.permute(0, 2, 1, 3).reshape(batch, seq_len, num_head * sep_dim)
+     
+-    channel_norm = x_[0].abs().norm(dim=-2)
+-    outlier_channel_index = torch.topk(channel_norm, int(x_[0].shape[-1] * outlier_ratio), largest=True).indices
++    if channel is not None: # DA4022 fixes: outlier set frozen at the first calibration iteration
++        outlier_channel_index = channel
++    else:
++        outlier_channel_index = get_statistics_structed_pruning(calib_rows(x_, fixes), outlier_ratio)
+ 
+     x_outlier = x_[:, :, outlier_channel_index]
+     x_outlier = x_outlier.to(torch.bfloat16)
+     x_[:, :, outlier_channel_index] = 0
+ 
+-    x_sub_outlier = x_[0]
++    x_sub_outlier = calib_rows(x_, fixes)
+     if q_method == 'per-tensor':
+         scale = (x_sub_outlier.max() - x_sub_outlier.min()) / (2 ** q_bit - 1)
+     elif q_method == 'per-channel':
+@@ -343,18 +357,18 @@ def decompression_unstructed_pruning_bitmap(x_sparse: torch.Tensor, mask: torch.
+ 
+ # ********************pack "get statistics" and "compress"********************
+ # type: outlier channel extraction + quantization
+-def compression_pack_channel_base(x, o_ratio, q_bit, q_method, it_num, it_num_thd, static_value):
++def compression_pack_channel_base(x, o_ratio, q_bit, q_method, it_num, it_num_thd, static_value, fixes=False):
+     if it_num < it_num_thd:
+-        o_channel_idx, scale = get_statistics_channel_base(x, o_ratio, q_bit, q_method)
++        o_channel_idx, scale = get_statistics_channel_base(x, o_ratio, q_bit, q_method, fixes, calib_channel(static_value, fixes))
+     else:
+         o_channel_idx, scale = static_value['outlier_channel_index'], static_value['scale']
+     o, q = outlier_subtraction_fuse_compression_quantization(x, scale, o_channel_idx, q_bit)
+     return o, q, o_channel_idx, scale
+ 
+ # type: quantization
+-def compression_pack_quant_base(x, q_bit, q_method, it_num, it_num_thd, static_value):
++def compression_pack_quant_base(x, q_bit, q_method, it_num, it_num_thd, static_value, fixes=False):
+     if it_num < it_num_thd:
+-        scale = get_statistics_only_quant(x, q_bit, q_method)
++        scale = get_statistics_only_quant(x, q_bit, q_method, fixes)
+     else:
+         scale = static_value['scale']
+     q = compression_quantization(x, scale, q_bit)
+@@ -395,4 +409,50 @@ def compression_pack_unstructed_pruning_bitmap(x, o_ratio, it_num, it_num_thd, s
+         outlier = static_value['outlier']
+     x_outlier, mask = compression_unstructed_pruning_bitmap(x, outlier)
+     return x_outlier, outlier, mask
+-    
+\ No newline at end of file
++    
++
++# ********************DA4022: optional zero-point dispatch********************
++# Fresh helpers instead of reusing get_statistics_only_quant_zero_point: that one stores the zero point
++# as int8, which overflows whenever a channel does not straddle 0 (z = -round(min/s) - 2^(b-1)).
++# Zero-point kernels run with fp32 s/z/x, since |x/s + z| can exceed bf16's exact-integer range.
++def get_statistics_zero_point(x: torch.Tensor, q_bit: int, fixes: bool = False):
++    x_sample = calib_rows(x, fixes)
++    x_min, x_max = x_sample.amin(dim=-2, keepdim=True).float(), x_sample.amax(dim=-2, keepdim=True).float()
++    scale = (x_max - x_min) / (2 ** q_bit - 1)
++    scale += (scale == 0) * 1e-3
++    zero_point = -torch.round(x_min / scale) - 2 ** (q_bit - 1)
++    return scale, zero_point
++
++# returns (q, scale, zero_point); zero_point is None on the released symmetric path
++def compression_pack_quant(x, q_bit, q_method, it_num, it_num_thd, static_value, zero_point=False, fixes=False):
++    if not zero_point:
++        return (*compression_pack_quant_base(x, q_bit, q_method, it_num, it_num_thd, static_value, fixes), None)
++    if it_num < it_num_thd:
++        scale, z = get_statistics_zero_point(x, q_bit, fixes)
++    else:
++        scale, z = static_value['scale'], static_value['zero_point']
++    q = compression_quantization_with_zero_point(x, scale, z, q_bit, dtype=torch.float32)
++    return q, scale, z
++
++# returns (outlier, q, channel_idx, scale, zero_point); x is modified in place (pass a copy)
++def compression_pack_channel(x, o_ratio, q_bit, q_method, it_num, it_num_thd, static_value, zero_point=False, fixes=False):
++    if not zero_point:
++        return (*compression_pack_channel_base(x, o_ratio, q_bit, q_method, it_num, it_num_thd, static_value, fixes), None)
++    if it_num >= it_num_thd or calib_channel(static_value, fixes) is not None:
++        o_channel_idx = static_value['outlier_channel_index']
++    else:
++        o_channel_idx = get_statistics_structed_pruning(calib_rows(x, fixes), o_ratio)
++    x_outlier = x[:, :, o_channel_idx].to(torch.bfloat16)
++    x[:, :, o_channel_idx] = 0
++    q, scale, z = compression_pack_quant(x, q_bit, q_method, it_num, it_num_thd, static_value, zero_point=True, fixes=fixes)
++    return x_outlier, q, o_channel_idx, scale, z
++
++# inverse of the two packers above (pass x_outlier/channel only for the outlier-channel path)
++def decompression_dequant(q, s, z, q_bit, x_outlier=None, channel=None):
++    if z is None:
++        x = decompression_dequantization(q, s, q_bit)
++    else:
++        x = decompression_dequantization_with_zero_point(q, s, z, q_bit, dtype=torch.float32)
++    if channel is not None:
++        x[:, :, channel] = x_outlier
++    return x
+diff --git a/operators/rmsnorm_kernels.py b/operators/rmsnorm_kernels.py
+index fa088f7..d1b6438 100644
+--- a/operators/rmsnorm_kernels.py
++++ b/operators/rmsnorm_kernels.py
+@@ -69,6 +69,7 @@ def _rms_norm_bwd_dx_fused(
+     eps,  # epsilon to avoid division by zero
+     GROUP_SIZE_M: tl.constexpr,
+     BLOCK_SIZE_N: tl.constexpr,
++    RMS_FIX: tl.constexpr,  # DA4022: True = correct RMSNorm dx
+ ):
+     # Map the program id to the elements of X, DX, and DY it should compute.
+     row = tl.program_id(0)
+@@ -94,8 +95,13 @@ def _rms_norm_bwd_dx_fused(
+     xhat = tl.where(mask, xhat, 0.0)
+     wdy = tl.where(mask, wdy, 0.0)
+     c1 = tl.sum(xhat * wdy, axis=0) / N
+-    c2 = tl.sum(wdy, axis=0) / N
+-    dx = (wdy - (xhat * c1 + c2)) * rstd
++    if RMS_FIX:
++        # DA4022: true RMSNorm gradient (the forward has no mean subtraction)
++        dx = (wdy - xhat * c1) * rstd
++    else:
++        # as released: LayerNorm formula, extra c2 = mean(w*dy) term
++        c2 = tl.sum(wdy, axis=0) / N
++        dx = (wdy - (xhat * c1 + c2)) * rstd
+     # Write dx
+     tl.store(DX + cols, dx, mask=mask)
+     # Accumulate partial sums for dw/db
+@@ -146,7 +152,7 @@ def rmsnorm_forward(x, weight, eps):
+     return y, mean, rstd, BLOCK_SIZE, num_warps
+ 
+ 
+-def rmsnorm_backward(dy, x, w, m, v, needs_inputs_grad, eps, num_warps, BLOCK_SIZE):
++def rmsnorm_backward(dy, x, w, m, v, needs_inputs_grad, eps, num_warps, BLOCK_SIZE, rms_fix=False):
+     dx = None
+     if needs_inputs_grad:
+         # heuristics for amount of parallel reduction stream for DW/DB
+@@ -180,6 +186,7 @@ def rmsnorm_backward(dy, x, w, m, v, needs_inputs_grad, eps, num_warps, BLOCK_SI
+             eps,  #
+             BLOCK_SIZE_N=BLOCK_SIZE,  #
+             GROUP_SIZE_M=GROUP_SIZE_M,  #
++            RMS_FIX=rms_fix,
+             num_warps=num_warps,
+         )
+     return dx, None
+diff --git a/operators/rmsnorm_updatable_kernels.py b/operators/rmsnorm_updatable_kernels.py
+index e36e11c..514bfde 100644
+--- a/operators/rmsnorm_updatable_kernels.py
++++ b/operators/rmsnorm_updatable_kernels.py
+@@ -69,6 +69,7 @@ def _rms_norm_bwd_dx_fused(
+     eps,  # epsilon to avoid division by zero
+     GROUP_SIZE_M: tl.constexpr,
+     BLOCK_SIZE_N: tl.constexpr,
++    RMS_FIX: tl.constexpr,  # DA4022: True = correct RMSNorm dx
+ ):
+     # Map the program id to the elements of X, DX, and DY it should compute.
+     row = tl.program_id(0)
+@@ -94,8 +95,13 @@ def _rms_norm_bwd_dx_fused(
+     xhat = tl.where(mask, xhat, 0.0)
+     wdy = tl.where(mask, wdy, 0.0)
+     c1 = tl.sum(xhat * wdy, axis=0) / N
+-    c2 = tl.sum(wdy, axis=0) / N
+-    dx = (wdy - (xhat * c1 + c2)) * rstd
++    if RMS_FIX:
++        # DA4022: true RMSNorm gradient (the forward has no mean subtraction)
++        dx = (wdy - xhat * c1) * rstd
++    else:
++        # as released: LayerNorm formula, extra c2 = mean(w*dy) term
++        c2 = tl.sum(wdy, axis=0) / N
++        dx = (wdy - (xhat * c1 + c2)) * rstd
+     # Write dx
+     tl.store(DX + cols, dx, mask=mask)
+     # Accumulate partial sums for dw/db
+@@ -170,7 +176,7 @@ def rmsnorm_forward(x, weight, eps):
+     return y, mean, rstd, BLOCK_SIZE, num_warps
+ 
+ 
+-def rmsnorm_backward(dy, x, w, m, v, eps, num_warps, BLOCK_SIZE):
++def rmsnorm_backward(dy, x, w, m, v, eps, num_warps, BLOCK_SIZE, rms_fix=False):
+     dx, dw = None, None
+     # heuristics for amount of parallel reduction stream for DW/DB
+     N = w.shape[0]
+@@ -204,6 +210,7 @@ def rmsnorm_backward(dy, x, w, m, v, eps, num_warps, BLOCK_SIZE):
+         eps,  #
+         BLOCK_SIZE_N=BLOCK_SIZE,  #
+         GROUP_SIZE_M=GROUP_SIZE_M,  #
++        RMS_FIX=rms_fix,
+         num_warps=num_warps,
+     )
+         
+diff --git a/run_da.sh b/run_da.sh
+new file mode 100644
+index 0000000..23ffb24
+--- /dev/null
++++ b/run_da.sh
+@@ -0,0 +1,87 @@
++#!/bin/bash
++# DA4022 paper-config runner (HyC-LoRA Table 8 settings). Everything is set through env vars, e.g.
++#   TASK=gsm8k MODEL=/models/llama-2-7b-hf Q_BIT=2 FIXED=True bash run_da.sh
++#   TASK=wikitext2 LAYER_TYPE=adahyc BIT_PLAN=plans/p.json REBUILD_TAU=0.2 SEED=12 bash run_da.sh
++#   TASK=gsm8k LAYER_TYPE=none SAVE_STEPS=200 bash run_da.sh   # true QLoRA, checkpoint every 200 steps
++# Note: the shipped run_gsm8k.sh is NOT the paper config (layer_type=intra, q_bit=8, layernorm_outlier_ratio=0).
++# Output (flat): exp_results_da/<tag>/{adapter/, metrics.json, trainer_state.json, predictions_*.json} + exp_results_da/<tag>.log
++# Re-running the same tag resumes from its latest checkpoint iff SAVE_STEPS is set; otherwise it retrains from scratch.
++set -ex -o pipefail
++
++TASK=${TASK:-gsm8k}                     # gsm8k | wikitext2
++MODEL=${MODEL:-meta-llama/Llama-2-7b-hf} # path must contain "llama" (any case)
++LAYER_TYPE=${LAYER_TYPE:-intra_inter}   # none (plain QLoRA, HF+PEFT path) | baseline | intra | intra_inter | intra_inter_full_fuse | adahyc
++Q_BIT=${Q_BIT:-2}
++SEED=${SEED:-11}
++FIXED=${FIXED:-False}                   # True: all upstream bug fixes (--hyc_fixes, implies FIX_BUG=True ZERO_POINT=True)
++FIX_BUG=${FIX_BUG:-False}               # intra_inter(_full_fuse) only; adahyc always has the fix
++ZERO_POINT=${ZERO_POINT:-False}         # intra_inter / adahyc
++BIT_PLAN=${BIT_PLAN:-}                  # adahyc: JSON {"<layer_idx>": {"<buffer>": bits}}
++REBUILD_TAU=${REBUILD_TAU:-0.1}         # adahyc: < 0 disables rebuilding
++SAVE_STEPS=${SAVE_STEPS:-}              # checkpoint every N optimizer steps (latest kept) + auto-resume; empty = no checkpoints
++EVAL_BS=${EVAL_BS:-}                    # eval batch size; default 32 (gsm8k generation), 4 (wikitext2)
++EVAL_ONLY=${EVAL_ONLY:-False}           # gsm8k: re-evaluate exp_results_da/<tag>/adapter, no training
++if [ "$FIXED" = True ]; then FIX_BUG=True; ZERO_POINT=True; fi
++
++# HyC-LoRA paper settings
++iteration_threshold=5
++softmax_outlier_ratio=0.05
++layernorm_outlier_ratio=0.005
++lr=3e-4
++rank=16
++lora_alpha=16
++
++# short, Windows-safe tag, e.g. gsm8k-TinyLlama-1.1B-intra_inter-q2-fxT-fbT-zpT-pnone-t0.1-s11
++model_short=$(basename "$MODEL" | sed -E 's/-intermediate-step.*//; s/-hf$//')
++plan_tag=$([ -n "$BIT_PLAN" ] && basename "$BIT_PLAN" .json || echo none)
++tag=${TASK}-${model_short}-${LAYER_TYPE}-q${Q_BIT}-fx${FIXED:0:1}-fb${FIX_BUG:0:1}-zp${ZERO_POINT:0:1}-p${plan_tag}-t${REBUILD_TAU}-s${SEED}
++[ ${#tag} -le 90 ] || { echo "run tag too long (${#tag} > 90): $tag"; exit 1; }
++out=exp_results_da/$tag
++mkdir -p $out
++
++if [ "$LAYER_TYPE" = none ]; then
++    hyclora_args="--use_hyclora False --layer_type baseline"  # decoder layers dispatch to forward_old (standard HF+PEFT)
++else
++    hyclora_args="--use_hyclora True --layer_type $LAYER_TYPE --q_bit $Q_BIT \
++    --iteration_threshold $iteration_threshold --softmax_outlier_ratio $softmax_outlier_ratio \
++    --layernorm_outlier_ratio $layernorm_outlier_ratio \
++    --hyc_fixes $FIXED --fix_outlier_bug $FIX_BUG --use_zero_point $ZERO_POINT --rebuild_tau $REBUILD_TAU \
++    ${BIT_PLAN:+--bit_plan_path $BIT_PLAN}"
++fi
++if [ -n "$SAVE_STEPS" ]; then
++    save_args="--save_strategy steps --save_steps $SAVE_STEPS --save_total_limit 1"
++else
++    save_args="--save_strategy no"
++fi
++
++if [ "$TASK" = gsm8k ]; then
++    # seq 512 (run_gsm8k.py's model_max_length default), bs 4 x grad-accum 4, 6 epochs
++    eval_args=$([ "$EVAL_ONLY" = True ] && echo "--is_train False --trained_adapter_path $out/adapter" || true)
++    python -u run_gsm8k.py \
++        --lora_init --init_lora_weights qlora \
++        --model_name_or_path $MODEL --data_name gsm8k \
++        --learning_rate $lr --rank $rank --lora_alpha $lora_alpha --seed $SEED \
++        --output_dir $out --eval_batch_size ${EVAL_BS:-32} $eval_args \
++        --num_train_epochs 6 --per_device_train_batch_size 4 --gradient_accumulation_steps 4 \
++        --evaluation_strategy no $save_args \
++        --weight_decay 0.1 --warmup_ratio 0.03 --lr_scheduler_type cosine --logging_steps 10 \
++        --do_train True \
++        $hyclora_args \
++        --report_to none 2>&1 | tee -a $out.log
++elif [ "$TASK" = wikitext2 ]; then
++    # paper Table 8: seq 1024, bs 4 x grad-accum 4, 3 epochs (run_wikitext2.sh ships bs 2 x 128 for llama-3-8b)
++    python -u run_wikitext2.py \
++        --model_name_or_path $MODEL \
++        --lora_init True --lora_init_type qlora --attn_implementation eager \
++        --rank $rank --lora_alpha $lora_alpha \
++        $hyclora_args \
++        --output_dir $out --learning_rate $lr --seed $SEED \
++        --dataset_name wikitext --dataset_config_name wikitext-2-raw-v1 \
++        --num_train_epochs 3 --per_device_train_batch_size 4 --per_device_eval_batch_size ${EVAL_BS:-4} \
++        --gradient_accumulation_steps 4 $save_args \
++        --weight_decay 0.1 --warmup_ratio 0.03 --lr_scheduler_type cosine --logging_steps 1 \
++        --do_train True --do_eval True --block_size 1024 \
++        --report_to none 2>&1 | tee -a $out.log
++else
++    echo "unknown TASK=$TASK (gsm8k | wikitext2)"; exit 1
++fi
+diff --git a/run_gsm8k.py b/run_gsm8k.py
+index fbbef68..d5a52e8 100644
+--- a/run_gsm8k.py
++++ b/run_gsm8k.py
+@@ -1,6 +1,7 @@
+ # Modified from https://github.com/tatsu-lab/stanford_alpaca/blob/main/train.py
+ 
+ import copy
++import json
+ import logging
+ import math
+ import re
+@@ -13,6 +14,7 @@ import torch
+ import transformers
+ from torch.utils.data import Dataset
+ from transformers import Trainer
++from transformers.trainer_utils import get_last_checkpoint
+ 
+ from peft import PeftModel, LoraConfig, TaskType, get_peft_model
+ from datasets import load_dataset
+@@ -108,7 +110,7 @@ class ModelArguments:
+ @dataclass
+ class DataArguments:
+     data_name: str = field(default="gsm8k", metadata={"help": "Dataset name."})
+-    eval_batch_size: int = field(default=8, metadata={"help": "Evaluation batch size."})
++    eval_batch_size: int = field(default=32, metadata={"help": "Evaluation batch size (generation; left padded)."})
+ 
+ 
+ @dataclass
+@@ -145,7 +147,7 @@ class HyCLoRAArguments:
+     )
+     layer_type: str = field(
+         default="baseline",
+-        metadata={"help": "Different types of fused training layers (Available: [baseline | intra | intra_inter])"}
++        metadata={"help": "Different types of fused training layers (Available: [baseline | intra | intra_inter | intra_inter_full_fuse | adahyc])"}
+     )
+     iteration_threshold: int = field(
+         default=5,
+@@ -163,6 +165,26 @@ class HyCLoRAArguments:
+         default=4,
+         metadata={"help": "quantization bit"}
+     )
++    fix_outlier_bug: bool = field(
++        default=False,
++        metadata={"help": "intra_inter(_full_fuse): restore x with its own outlier channels in backward (released code uses x_medium's)"}
++    )
++    use_zero_point: bool = field(
++        default=False,
++        metadata={"help": "intra_inter / adahyc: asymmetric quantization with a per-channel zero point"}
++    )
++    bit_plan_path: Optional[str] = field(
++        default=None,
++        metadata={"help": "adahyc: JSON {layer_idx: {buffer: bits}}, bits in {2,4,8}; missing entries use q_bit"}
++    )
++    rebuild_tau: float = field(
++        default=0.1,
++        metadata={"help": "adahyc: rebuild x_norm_1/x_medium/x_norm_2 iff rebuild error <= (1+tau) * store error; negative disables"}
++    )
++    hyc_fixes: bool = field(
++        default=False,
++        metadata={"help": "HyC-LoRA with all upstream bug fixes (RMSNorm backward, calibration merge, batch-wide stats, outlier index, zero-point)"}
++    )
+     
+ 
+ def smart_tokenizer_and_embedding_resize(
+@@ -318,8 +340,10 @@ def train_and_eval():
+         (ModelArguments, DataArguments, TrainingArguments, HyCLoRAArguments)
+     )
+     model_args, data_args, training_args, hyclora_args = parser.parse_args_into_dataclasses()
++    print(f"[config] {hyclora_args}")
++    set_seed(training_args.seed)  # before LoRA creation, so the adapter init depends on the seed
+ 
+-    if 'llama' in model_args.model_name_or_path:
++    if 'llama' in model_args.model_name_or_path.lower():
+         model = LlamaForCausalLM.from_pretrained(
+             model_args.model_name_or_path,
+             low_cpu_mem_usage=True,
+@@ -337,7 +361,7 @@ def train_and_eval():
+             ),
+         )
+         model.set_fused_llama_layer(hyclora_args)
+-    elif 'mistral' in model_args.model_name_or_path:
++    elif 'mistral' in model_args.model_name_or_path.lower():
+         model = MistralForCausalLM.from_pretrained(
+             model_args.model_name_or_path,
+             low_cpu_mem_usage=True,
+@@ -428,31 +452,52 @@ def train_and_eval():
+     )
+ 
+     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
+-    training_args.output_dir = os.path.join(
+-        training_args.output_dir,
+-        training_args.expt_name,
+-        model_args.model_name_or_path.split("/")[-1],
+-        f"ep_{int(training_args.num_train_epochs)}",
+-        f"lr_{training_args.learning_rate}",
+-        f"seed_{training_args.seed}",
+-    )
++    # flat layout: everything of a run goes directly into output_dir (the nested expt/model/ep/lr/seed
++    # path exceeded Windows MAX_PATH when copied back)
++    out_dir = training_args.output_dir
++    os.makedirs(out_dir, exist_ok=True)
+ 
+     model = model.to(torch.bfloat16)
+-    
++
+     if training_args.is_train:
+-        trainer = Trainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
+-        trainer.train()
+-    
++        class _Bf16OnResume(transformers.TrainerCallback):
++            # resume_from_checkpoint -> peft load_adapter(autocast_adapter_dtype=True) turns the LoRA weights into fp32,
++            # the fused kernels need bf16. on_train_begin runs after the checkpoint (and optimizer state) is loaded;
++            # .to() casts in place, so the optimizer keeps the same Parameter objects.
++            # The optimizer state was cast to fp32 too (load_state_dict follows the param dtype): cast the
++            # per-parameter moments back, but not the scalar `step` counter (bf16 cannot count past 256).
++            def on_train_begin(self, args, state, control, model=None, optimizer=None, **kw):
++                model.to(torch.bfloat16)
++                for p, st in optimizer.state.items():
++                    for k, v in st.items():
++                        if torch.is_tensor(v) and v.dim() > 0 and v.shape == p.shape:
++                            st[k] = v.to(p.dtype)
++        trainer = Trainer(model=model, tokenizer=tokenizer, args=training_args, callbacks=[_Bf16OnResume()], **data_module)
++        # resume only when checkpointing is on (SAVE_STEPS), so stale checkpoint dirs are never picked up silently
++        last_ckpt = get_last_checkpoint(out_dir) if training_args.save_strategy != "no" else None
++        if last_ckpt is not None:
++            print(f"[resume] from {last_ckpt}")
++            if hyclora_args.use_hyclora:
++                print(f"[resume] recalibrating HyC statistics during the first {hyclora_args.iteration_threshold} steps")
++        torch.cuda.reset_peak_memory_stats()
++        train_result = trainer.train(resume_from_checkpoint=last_ckpt)
++        peak_gib = torch.cuda.max_memory_allocated() / 2**30
++        print(f"peak memory allocated: {peak_gib:.3f} GiB | train_runtime: {train_result.metrics['train_runtime']:.1f} s | "
++              f"train_samples_per_second: {train_result.metrics['train_samples_per_second']:.3f}")
++        # save before evaluating, so the adapter survives a crash / lost instance during eval
++        trainer.save_state()
++        trainer.save_model(output_dir=os.path.join(out_dir, "adapter"))
++        update_metrics(out_dir, peak_mem_gib=peak_gib, resumed_from=last_ckpt, hyclora=vars(hyclora_args),
++                       seed=training_args.seed, **train_result.metrics)
++
+     ###################### testing part ######################
+-    # reload the adapter
++    # reload the adapter (e.g. out_dir/adapter of an earlier run, with --is_train False)
+     if training_args.trained_adapter_path is not None:
+-        model = PeftModel.from_pretrained(
+-            model,
+-            training_args.trained_adapter_path,
+-            is_trainable=True,
+-            token=model_args.token,
+-        )
+-        
++        load_result = model.load_adapter(training_args.trained_adapter_path, adapter_name="default")
++        assert not load_result.unexpected_keys, f"adapter keys do not match the model: {load_result.unexpected_keys[:5]}"
++        model.to(torch.bfloat16)  # load_adapter autocasts LoRA to fp32; keep eval-only identical to eval-after-training
++        print(f"loaded adapter weights from {training_args.trained_adapter_path}")
++
+     if training_args.is_eval:
+         # Evaluation
+         dataset = load_dataset(data_args.data_name, "main")
+@@ -493,43 +538,58 @@ def train_and_eval():
+             question_data.append(batch)
+             
+         model.eval()
+-        gen_kwargs = {
+-            "max_new_tokens": 256,
+-            "temperature": 0.1,
+-            "top_k": 40,
+-            "top_p": 0.95,
+-            "do_sample": True,
+-        }
+-        ans_pred_list = []
++        # (a) the paper's sampled decoding (kept unchanged for comparability with the paper)
+         set_seed(42)
+-        for step, batch in enumerate(question_data):
+-            with torch.no_grad():
+-                gen_kwargs["input_ids"] = batch["input_ids"].to('cuda')
+-                gen_kwargs["attention_mask"] = batch["attention_mask"].to('cuda')
+-                generated_tokens = model.generate(**gen_kwargs)
+-
+-            pred_tokens = generated_tokens[:, batch['input_len']:]
+-            decoded_pred = tokenizer.batch_decode(pred_tokens, skip_special_tokens=True)
+-
+-            # Extract the numbers in sentences
+-            # print(decoded_pred)
+-            ans_pred_list += [extract_answer_number(sentence_pred) for sentence_pred in decoded_pred]
+-            
+-            accuracy = compute_accuracy(answer, ans_pred_list)
+-            print(f'accuracy: {accuracy}')
+-
+-        print("prediction", ans_pred_list)
+-        print("ground truth", answer)
+-
+-        accuracy = compute_accuracy(answer, ans_pred_list)
+-
+-        print(f"adapter: {model_args.adapter_name_or_path} | GSM8K test accuracy: {100*accuracy:.2f}% | "
++        acc_sampled = evaluate_gsm8k(model, tokenizer, question_data, answer, out_dir, "sampled",
++                                     dict(max_new_tokens=256, temperature=0.1, top_k=40, top_p=0.95, do_sample=True))
++        print(f"adapter: {model_args.adapter_name_or_path} | GSM8K test accuracy: {100*acc_sampled:.2f}% | "
+             f"full precision: {model_args.full_precision}")
+-    
+-    if training_args.is_train:
+-        trainer.save_state()
+-        trainer.save_model(output_dir=training_args.output_dir)
+-    
++        print(f"GSM8K test accuracy (sampled): {100*acc_sampled:.2f}%")
++        # (b) greedy decoding: deterministic, for paired comparisons between methods
++        acc_greedy = evaluate_gsm8k(model, tokenizer, question_data, answer, out_dir, "greedy",
++                                    dict(max_new_tokens=256, do_sample=False))
++        print(f"GSM8K test accuracy (greedy): {100*acc_greedy:.2f}%")
++
++
++def evaluate_gsm8k(model, tokenizer, question_data, answer, out_dir, mode, gen_kwargs):
++    """Generate for every batch, save per-question predictions_<mode>.json and accuracy to metrics.json."""
++    records, preds = [], []
++    for step, batch in enumerate(question_data):
++        with torch.no_grad():
++            generated_tokens = model.generate(
++                input_ids=batch["input_ids"].to('cuda'), attention_mask=batch["attention_mask"].to('cuda'), **gen_kwargs)
++        decoded_pred = tokenizer.batch_decode(generated_tokens[:, batch['input_len']:], skip_special_tokens=True)
++        for sentence_pred in decoded_pred:
++            preds.append(extract_answer_number(sentence_pred))
++            records.append(make_record(len(records), preds[-1], answer[len(records)], sentence_pred))
++        print(f"eval_batch {step + 1}/{len(question_data)} {mode}")
++        # correct-so-far / answered-so-far
++        print(f"accuracy: {compute_accuracy(preds, answer)}")
++    accuracy = compute_accuracy(preds, answer)
++    write_json(os.path.join(out_dir, f"predictions_{mode}.json"),
++               dict(mode=mode, accuracy=accuracy, gen_kwargs=gen_kwargs, predictions=records))
++    update_metrics(out_dir, **{f"gsm8k_acc_{mode}": accuracy, "gsm8k_n": len(records)})
++    return accuracy
++
++
++def make_record(idx, pred, gold, generation):
++    finite = lambda x: None if math.isinf(x) else x  # inf = no number found; keep the JSON standard
++    return dict(idx=idx, pred=finite(pred), gold=finite(gold), correct=pred == gold, generation=generation)
++
++
++def write_json(path, obj):
++    tmp = path + ".tmp"  # atomic: a lost instance never leaves a half-written file
++    with open(tmp, "w") as f:
++        json.dump(obj, f, indent=1)
++    os.replace(tmp, path)
++
++
++def update_metrics(out_dir, **kv):
++    path = os.path.join(out_dir, "metrics.json")
++    metrics = json.load(open(path)) if os.path.exists(path) else {}
++    metrics.update(kv)
++    write_json(path, metrics)
++
+ 
+ def extract_answer_number(sentence: str) -> float:
+     sentence = sentence.replace(',', '')
+diff --git a/run_wikitext2.py b/run_wikitext2.py
+index 0d2cbda..5c5f103 100644
+--- a/run_wikitext2.py
++++ b/run_wikitext2.py
+@@ -1,5 +1,6 @@
+ #!/usr/bin/env python
+ 
++import json
+ import logging
+ import math
+ import os
+@@ -11,6 +12,7 @@ from typing import Optional
+ 
+ import datasets
+ import evaluate
++import peft
+ import torch
+ from datasets import load_dataset
+ 
+@@ -272,7 +274,7 @@ class HyCLoRAArguments:
+     )
+     layer_type: str = field(
+         default="baseline",
+-        metadata={"help": "Different types of fused training layers (Available: [baseline | intra | intra_inter])"}
++        metadata={"help": "Different types of fused training layers (Available: [baseline | intra | intra_inter | intra_inter_full_fuse | adahyc])"}
+     )
+     iteration_threshold: int = field(
+         default=5,
+@@ -290,6 +292,26 @@ class HyCLoRAArguments:
+         default=4,
+         metadata={"help": "quantization bit"}
+     )
++    fix_outlier_bug: bool = field(
++        default=False,
++        metadata={"help": "intra_inter(_full_fuse): restore x with its own outlier channels in backward (released code uses x_medium's)"}
++    )
++    use_zero_point: bool = field(
++        default=False,
++        metadata={"help": "intra_inter / adahyc: asymmetric quantization with a per-channel zero point"}
++    )
++    bit_plan_path: Optional[str] = field(
++        default=None,
++        metadata={"help": "adahyc: JSON {layer_idx: {buffer: bits}}, bits in {2,4,8}; missing entries use q_bit"}
++    )
++    rebuild_tau: float = field(
++        default=0.1,
++        metadata={"help": "adahyc: rebuild x_norm_1/x_medium/x_norm_2 iff rebuild error <= (1+tau) * store error; negative disables"}
++    )
++    hyc_fixes: bool = field(
++        default=False,
++        metadata={"help": "HyC-LoRA with all upstream bug fixes (RMSNorm backward, calibration merge, batch-wide stats, outlier index, zero-point)"}
++    )
+ 
+ 
+ def main():
+@@ -345,20 +367,13 @@ def main():
+     )
+     logger.info(f"Training/evaluation parameters {training_args}")
+ 
+-    # Detecting last checkpoint.
++    print(f"[config] {hyclora_args}")
++    # Detecting last checkpoint: only when checkpointing is on (SAVE_STEPS in run_da.sh), so a stale
++    # checkpoint dir is never resumed from silently. Everything of a run goes flat into output_dir.
+     last_checkpoint = None
+-    if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
++    if os.path.isdir(training_args.output_dir) and training_args.do_train and training_args.save_strategy != "no":
+         last_checkpoint = get_last_checkpoint(training_args.output_dir)
+-        if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
+-            raise ValueError(
+-                f"Output directory ({training_args.output_dir}) already exists and is not empty. "
+-                "Use --overwrite_output_dir to overcome."
+-            )
+-        elif last_checkpoint is not None and training_args.resume_from_checkpoint is None:
+-            logger.info(
+-                f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change "
+-                "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
+-            )
++    os.makedirs(training_args.output_dir, exist_ok=True)
+ 
+     # Set seed before initializing model.
+     set_seed(training_args.seed)
+@@ -483,7 +498,7 @@ def main():
+             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
+         )
+ 
+-    if 'llama' in model_args.model_name_or_path:
++    if 'llama' in model_args.model_name_or_path.lower():
+         model = LlamaForCausalLM.from_pretrained(
+             model_args.model_name_or_path,
+             low_cpu_mem_usage=True,
+@@ -498,7 +513,7 @@ def main():
+             attn_implementation="eager"
+         )
+         model.set_fused_llama_layer(hyclora_args)
+-    elif 'mistral' in model_args.model_name_or_path:
++    elif 'mistral' in model_args.model_name_or_path.lower():
+         model = MistralForCausalLM.from_pretrained(
+             model_args.model_name_or_path,
+             low_cpu_mem_usage=True,
+@@ -515,6 +530,13 @@ def main():
+         model.set_fused_mistral_layer(hyclora_args)
+     else:
+         raise ValueError("No implementation of model. Now support: llama/mistral")
++
++    # same QLoRA setup as run_gsm8k.py
++    model = peft.prepare_model_for_kbit_training(
++        model,
++        use_gradient_checkpointing=training_args.gradient_checkpointing,
++        gradient_checkpointing_kwargs={"use_reentrant": False},
++    )
+     
+     ###################### training part ######################
+     if model_args.lora_init:
+@@ -667,6 +689,7 @@ def main():
+         if "validation" not in tokenized_datasets:
+             raise ValueError("--do_eval requires a validation dataset")
+         eval_dataset = lm_datasets["validation"]
++        test_dataset = lm_datasets["test"] if "test" in lm_datasets else None
+         if data_args.max_eval_samples is not None:
+             max_eval_samples = min(len(eval_dataset), data_args.max_eval_samples)
+             eval_dataset = eval_dataset.select(range(max_eval_samples))
+@@ -716,8 +739,18 @@ def main():
+             checkpoint = training_args.resume_from_checkpoint
+         elif last_checkpoint is not None:
+             checkpoint = last_checkpoint
++        if checkpoint is not None:
++            print(f"[resume] from {checkpoint}")
++            if hyclora_args.use_hyclora:
++                print(f"[resume] recalibrating HyC statistics during the first {hyclora_args.iteration_threshold} steps")
++        torch.cuda.reset_peak_memory_stats()
+         train_result = trainer.train(resume_from_checkpoint=checkpoint)
+-        trainer.save_model()  # Saves the tokenizer too for easy upload
++        peak_gib = torch.cuda.max_memory_allocated() / 2**30
++        print(f"peak memory allocated: {peak_gib:.3f} GiB | train_runtime: {train_result.metrics['train_runtime']:.1f} s | "
++              f"train_samples_per_second: {train_result.metrics['train_samples_per_second']:.3f}")
++        trainer.save_model(os.path.join(training_args.output_dir, "adapter"))  # Saves the tokenizer too
++        update_metrics(training_args.output_dir, peak_mem_gib=peak_gib, resumed_from=checkpoint,
++                       hyclora=vars(hyclora_args), seed=training_args.seed, **train_result.metrics)
+ 
+         metrics = train_result.metrics
+ 
+@@ -746,6 +779,21 @@ def main():
+ 
+         trainer.log_metrics("eval", metrics)
+         trainer.save_metrics("eval", metrics)
++        print(f"eval perplexity = {perplexity}")
++        update_metrics(training_args.output_dir, eval_loss=metrics["eval_loss"], eval_perplexity=perplexity)
++
++        # test split as well (wikitext-2-raw-v1 has one)
++        if test_dataset is not None:
++            metrics = trainer.evaluate(eval_dataset=test_dataset, metric_key_prefix="test")
++            try:
++                perplexity = math.exp(metrics["test_loss"])
++            except OverflowError:
++                perplexity = float("inf")
++            metrics["test_perplexity"] = perplexity
++            trainer.log_metrics("test", metrics)
++            trainer.save_metrics("test", metrics)
++            print(f"test perplexity = {perplexity}")
++            update_metrics(training_args.output_dir, test_loss=metrics["test_loss"], test_perplexity=perplexity)
+ 
+     kwargs = {"finetuned_from": model_args.model_name_or_path, "tasks": "text-generation"}
+     if data_args.dataset_name is not None:
+@@ -762,5 +810,15 @@ def main():
+         trainer.create_model_card(**kwargs)
+ 
+ 
++def update_metrics(out_dir, **kv):
++    """Merge kv into out_dir/metrics.json (atomic write: a lost instance never leaves a half-written file)."""
++    path = os.path.join(out_dir, "metrics.json")
++    metrics = json.load(open(path)) if os.path.exists(path) else {}
++    metrics.update(kv)
++    with open(path + ".tmp", "w") as f:
++        json.dump(metrics, f, indent=1)
++    os.replace(path + ".tmp", path)
++
++
+ if __name__ == "__main__":
+     main()

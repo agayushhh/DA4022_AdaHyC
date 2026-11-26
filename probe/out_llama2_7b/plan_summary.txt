@@ -1,0 +1,35 @@
+all-2-bit HyC-LoRA baseline avg bits 2.0117 | budget 2.0117 | plan avg bits 2.0107
+predicted total sensitivity: plan 0.2501 vs HyC all-2-bit 0.5548
+layers rebuilding x_norm_1/x_medium/x_norm_2: 32/31/32 of 32
+layer  0: rebuild x_norm_1,x_medium,x_norm_2 upgraded -
+layer  1: rebuild x_norm_1,x_medium,x_norm_2 upgraded -
+layer  2: rebuild x_norm_1,x_medium,x_norm_2 upgraded -
+layer  3: rebuild x_norm_1,x_medium,x_norm_2 upgraded -
+layer  4: rebuild x_norm_1,x_medium,x_norm_2 upgraded {'gate': 4, 'up': 4}
+layer  5: rebuild x_norm_1,x_medium,x_norm_2 upgraded {'gate': 4, 'up': 4}
+layer  6: rebuild x_norm_1,x_medium,x_norm_2 upgraded {'gate': 4, 'up': 4}
+layer  7: rebuild x_norm_1,x_medium,x_norm_2 upgraded {'gate': 4, 'up': 4}
+layer  8: rebuild x_norm_1,x_medium,x_norm_2 upgraded {'gate': 4, 'up': 4}
+layer  9: rebuild x_norm_1,x_medium,x_norm_2 upgraded {'gate': 4, 'up': 4}
+layer 10: rebuild x_norm_1,x_medium,x_norm_2 upgraded {'gate': 4, 'up': 4}
+layer 11: rebuild x_norm_1,x_medium,x_norm_2 upgraded {'gate': 4, 'up': 4}
+layer 12: rebuild x_norm_1,x_medium,x_norm_2 upgraded {'q': 4, 'k': 4, 'v': 4, 'gate': 4, 'up': 4}
+layer 13: rebuild x_norm_1,x_medium,x_norm_2 upgraded {'gate': 4, 'up': 4}
+layer 14: rebuild x_norm_1,x_medium,x_norm_2 upgraded {'q': 4, 'k': 4, 'v': 4, 'gate': 4, 'up': 4}
+layer 15: rebuild x_norm_1,x_medium,x_norm_2 upgraded {'gate': 4, 'up': 4}
+layer 16: rebuild x_norm_1,x_medium,x_norm_2 upgraded {'q': 4, 'k': 4, 'v': 4, 'gate': 4, 'up': 4}
+layer 17: rebuild x_norm_1,x_medium,x_norm_2 upgraded -
+layer 18: rebuild x_norm_1,x_medium,x_norm_2 upgraded -
+layer 19: rebuild x_norm_1,x_medium,x_norm_2 upgraded -
+layer 20: rebuild x_norm_1,x_medium,x_norm_2 upgraded -
+layer 21: rebuild x_norm_1,x_medium,x_norm_2 upgraded -
+layer 22: rebuild x_norm_1,x_medium,x_norm_2 upgraded -
+layer 23: rebuild x_norm_1,x_medium,x_norm_2 upgraded -
+layer 24: rebuild x_norm_1,x_medium,x_norm_2 upgraded -
+layer 25: rebuild x_norm_1,x_medium,x_norm_2 upgraded -
+layer 26: rebuild x_norm_1,x_medium,x_norm_2 upgraded -
+layer 27: rebuild x_norm_1,x_medium,x_norm_2 upgraded -
+layer 28: rebuild x_norm_1,x_medium,x_norm_2 upgraded -
+layer 29: rebuild x_norm_1,x_medium,x_norm_2 upgraded {'gate': 4, 'up': 4}
+layer 30: rebuild x_norm_1,x_medium,x_norm_2 upgraded {'gate': 4, 'up': 4}
+layer 31: rebuild x_norm_1,x_norm_2          upgraded {'x_medium': 4, 'gate': 4, 'up': 4}

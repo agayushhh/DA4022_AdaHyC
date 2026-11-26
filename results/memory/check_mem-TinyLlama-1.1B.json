@@ -1,0 +1,69 @@
+{
+ "model": "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T",
+ "B": 4,
+ "S": 512,
+ "rows": [
+  {
+   "variant": "baseline (bf16, no compression)",
+   "config": {
+    "layer_type": "baseline"
+   },
+   "held_mib": 4762.3125,
+   "formula_avg_bits": 16.0,
+   "pct_of_bf16": 100.0
+  },
+  {
+   "variant": "intra_inter released q2",
+   "config": {
+    "layer_type": "intra_inter",
+    "q_bit": 2
+   },
+   "held_mib": 643.63037109375,
+   "formula_avg_bits": 2.0132978723404253,
+   "pct_of_bf16": 13.51508056419544
+  },
+  {
+   "variant": "intra_inter hyc_fixes q2",
+   "config": {
+    "layer_type": "intra_inter",
+    "q_bit": 2,
+    "hyc_fixes": true
+   },
+   "held_mib": 643.63037109375,
+   "formula_avg_bits": 2.0132978723404253,
+   "pct_of_bf16": 13.51508056419544
+  },
+  {
+   "variant": "intra_inter hyc_fixes q4",
+   "config": {
+    "layer_type": "intra_inter",
+    "q_bit": 4,
+    "hyc_fixes": true
+   },
+   "held_mib": 919.4501953125,
+   "formula_avg_bits": 4.013297872340425,
+   "pct_of_bf16": 19.30680095673058
+  },
+  {
+   "variant": "adahyc q2 tau0.1",
+   "config": {
+    "layer_type": "adahyc",
+    "q_bit": 2
+   },
+   "held_mib": 602.15576171875,
+   "formula_avg_bits": 1.689434235976789,
+   "pct_of_bf16": 12.644188337467355
+  },
+  {
+   "variant": "adahyc q2 plan plan.json",
+   "config": {
+    "layer_type": "adahyc",
+    "q_bit": 2,
+    "bit_plan_path": "../../probe/out_tinyllama/plan.json"
+   },
+   "held_mib": 650.8779296875,
+   "formula_avg_bits": 2.013056092843327,
+   "pct_of_bf16": 13.667266263763665
+  }
+ ]
+}

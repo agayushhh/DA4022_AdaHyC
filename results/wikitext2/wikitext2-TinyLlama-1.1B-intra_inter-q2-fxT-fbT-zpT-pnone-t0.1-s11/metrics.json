@@ -1,0 +1,28 @@
+{
+ "peak_mem_gib": 4.382750034332275,
+ "resumed_from": null,
+ "hyclora": {
+  "use_hyclora": true,
+  "layer_type": "intra_inter",
+  "iteration_threshold": 5,
+  "softmax_outlier_ratio": 0.05,
+  "layernorm_outlier_ratio": 0.005,
+  "q_bit": 2,
+  "fix_outlier_bug": true,
+  "use_zero_point": true,
+  "bit_plan_path": null,
+  "rebuild_tau": 0.1,
+  "hyc_fixes": true
+ },
+ "seed": 11,
+ "train_runtime": 3562.535,
+ "train_samples_per_second": 2.339,
+ "train_steps_per_second": 0.146,
+ "total_flos": 5.33985050492928e+16,
+ "train_loss": 2.0036586134879344,
+ "epoch": 2.98705035971223,
+ "eval_loss": 2.0003912448883057,
+ "eval_perplexity": 7.391947594963398,
+ "test_loss": 1.989397644996643,
+ "test_perplexity": 7.311128540832407
+}

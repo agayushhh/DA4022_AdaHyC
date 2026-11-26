@@ -1,0 +1,174 @@
+[cpu] rebuild rel-err with identity quantization: {'x_norm_1': '1.65e-03', 'x_medium': '4.52e-08', 'x_medium (no bias)': '4.48e-08', 'x_norm_2': '1.68e-03'}
+[cpu] RMSNorm dx rel-err vs autograd: fixed 0.0e+00, released (LayerNorm c2 term) 1.3e-01
+[cpu] avg stored bits, TinyLlama: HyC-LoRA 2-bit 2.0133, 2-bit + all three rebuilt 1.4960
+[cpu] calibration (zero_point=False): released ch0 scale 0.645 (true 0.805, shrunk); fixed index frozen [1, 0], scales over all samples
+[cpu] calibration (zero_point=True): released ch0 scale 0.644 (true 0.805, shrunk); fixed index frozen [1, 0], scales over all samples
+[cpu] all checks passed
+********** HycLora Configuration **********
+[INFO] HycLora type: baseline
+[INFO] Iteration Threshold: 5
+[INFO] Softmax Outlier Ratio: 0.05
+[INFO] Layernorm Outlier Ratio: 0.005
+[INFO] Quantization Bit: 4
+[INFO] hyc_fixes: False
+[INFO] fix_outlier_bug: False
+[INFO] use_zero_point: False
+[INFO] bit_plan_path: None
+[INFO] rebuild_tau: 0.1
+*******************************************
+Downloading readme: 0.00B [00:00, ?B/s]
+Downloading readme: 7.93kB [00:00, 15.6MB/s]
+********** HycLora is not used **********
+********** HycLora Configuration **********
+[INFO] HycLora type: baseline
+[INFO] Iteration Threshold: 5
+[INFO] Softmax Outlier Ratio: 0.05
+[INFO] Layernorm Outlier Ratio: 0.005
+[INFO] Quantization Bit: 4
+[INFO] hyc_fixes: False
+[INFO] fix_outlier_bug: False
+[INFO] use_zero_point: False
+[INFO] bit_plan_path: None
+[INFO] rebuild_tau: 0.1
+*******************************************
+fused baseline released    cos 0.998685  rel_err 0.0514  |dloss| 0.0015  avg_bits 16.0000
+********** HycLora Configuration **********
+[INFO] HycLora type: baseline
+[INFO] Iteration Threshold: 5
+[INFO] Softmax Outlier Ratio: 0.05
+[INFO] Layernorm Outlier Ratio: 0.005
+[INFO] Quantization Bit: 4
+[INFO] hyc_fixes: True
+[INFO] fix_outlier_bug: False
+[INFO] use_zero_point: False
+[INFO] bit_plan_path: None
+[INFO] rebuild_tau: 0.1
+*******************************************
+fused baseline hyc_fixes   cos 0.999622  rel_err 0.0275  |dloss| 0.0015  avg_bits 16.0000
+********** HycLora Configuration **********
+[INFO] HycLora type: intra_inter
+[INFO] Iteration Threshold: 5
+[INFO] Softmax Outlier Ratio: 0.05
+[INFO] Layernorm Outlier Ratio: 0.005
+[INFO] Quantization Bit: 8
+[INFO] hyc_fixes: False
+[INFO] fix_outlier_bug: False
+[INFO] use_zero_point: False
+[INFO] bit_plan_path: None
+[INFO] rebuild_tau: 0.1
+*******************************************
+intra_inter released q8    cos 0.835889  rel_err 0.6278  |dloss| 0.0006  avg_bits 8.0133
+********** HycLora Configuration **********
+[INFO] HycLora type: intra_inter
+[INFO] Iteration Threshold: 5
+[INFO] Softmax Outlier Ratio: 0.05
+[INFO] Layernorm Outlier Ratio: 0.005
+[INFO] Quantization Bit: 8
+[INFO] hyc_fixes: True
+[INFO] fix_outlier_bug: False
+[INFO] use_zero_point: False
+[INFO] bit_plan_path: None
+[INFO] rebuild_tau: 0.1
+*******************************************
+intra_inter hyc_fixes q8   cos 0.971665  rel_err 0.2591  |dloss| 0.0006  avg_bits 8.0133
+********** HycLora Configuration **********
+[INFO] HycLora type: intra_inter
+[INFO] Iteration Threshold: 5
+[INFO] Softmax Outlier Ratio: 0.05
+[INFO] Layernorm Outlier Ratio: 0.005
+[INFO] Quantization Bit: 2
+[INFO] hyc_fixes: False
+[INFO] fix_outlier_bug: False
+[INFO] use_zero_point: False
+[INFO] bit_plan_path: None
+[INFO] rebuild_tau: 0.1
+*******************************************
+intra_inter released q2    cos 0.582353  rel_err 0.8161  |dloss| 0.0006  avg_bits 2.0133
+********** HycLora Configuration **********
+[INFO] HycLora type: intra_inter
+[INFO] Iteration Threshold: 5
+[INFO] Softmax Outlier Ratio: 0.05
+[INFO] Layernorm Outlier Ratio: 0.005
+[INFO] Quantization Bit: 2
+[INFO] hyc_fixes: True
+[INFO] fix_outlier_bug: False
+[INFO] use_zero_point: False
+[INFO] bit_plan_path: None
+[INFO] rebuild_tau: 0.1
+*******************************************
+intra_inter hyc_fixes q2   cos 0.586029  rel_err 1.3000  |dloss| 0.0006  avg_bits 2.0133
+********** HycLora Configuration **********
+[INFO] HycLora type: intra_inter
+[INFO] Iteration Threshold: 5
+[INFO] Softmax Outlier Ratio: 0.999
+[INFO] Layernorm Outlier Ratio: 0.005
+[INFO] Quantization Bit: 8
+[INFO] hyc_fixes: False
+[INFO] fix_outlier_bug: False
+[INFO] use_zero_point: False
+[INFO] bit_plan_path: None
+[INFO] rebuild_tau: 0.1
+*******************************************
+released q8 dense-attn     cos 0.855879  rel_err 0.5943  |dloss| 0.0006  avg_bits 8.0133
+********** HycLora Configuration **********
+[INFO] HycLora type: intra_inter
+[INFO] Iteration Threshold: 5
+[INFO] Softmax Outlier Ratio: 0.999
+[INFO] Layernorm Outlier Ratio: 0.005
+[INFO] Quantization Bit: 8
+[INFO] hyc_fixes: True
+[INFO] fix_outlier_bug: False
+[INFO] use_zero_point: False
+[INFO] bit_plan_path: None
+[INFO] rebuild_tau: 0.1
+*******************************************
+hyc_fixes q8 dense-attn    cos 0.990463  rel_err 0.1523  |dloss| 0.0006  avg_bits 8.0133
+********** HycLora Configuration **********
+[INFO] HycLora type: adahyc
+[INFO] Iteration Threshold: 5
+[INFO] Softmax Outlier Ratio: 0.05
+[INFO] Layernorm Outlier Ratio: 0.005
+[INFO] Quantization Bit: 2
+[INFO] hyc_fixes: False
+[INFO] fix_outlier_bug: False
+[INFO] use_zero_point: False
+[INFO] bit_plan_path: /tmp/check_da_plan.json
+[INFO] rebuild_tau: 0.1
+[INFO] adahyc: hyc_fixes ALWAYS ON (RMSNorm dx, own outlier channels, frozen outlier index, all-sample statistics, zero-point); the fix/zp flags above are ignored
+*******************************************
+[adahyc] layer 0: rebuild=['x_medium', 'x_norm_1', 'x_norm_2'] (tau=0.1) bits={'x': 8, 'x_norm_1': 2, 'q': 2, 'k': 2, 'v': 2, 'o': 2, 'x_medium': 2, 'x_norm_2': 2, 'gate': 4, 'up': 4} rel-err rebuild/store: x_norm_1: 0.0043/0.3061, x_medium: 0.1426/0.4384, x_norm_2: 0.5896/0.5722, x_norm_2@rebuilt_x_medium: 0.3527/0.5722
+[adahyc] layer 1: rebuild=['x_medium', 'x_norm_1', 'x_norm_2'] (plan) bits={'x': 2, 'x_norm_1': 2, 'q': 2, 'k': 2, 'v': 2, 'o': 2, 'x_medium': 2, 'x_norm_2': 2, 'gate': 2, 'up': 2} rel-err rebuild/store:
+[adahyc] layer 2: rebuild=['x_medium', 'x_norm_1'] (tau=0.1) bits={'x': 2, 'x_norm_1': 2, 'q': 2, 'k': 2, 'v': 2, 'o': 2, 'x_medium': 2, 'x_norm_2': 2, 'gate': 4, 'up': 4} rel-err rebuild/store: x_norm_1: 0.3502/0.3391, x_medium: 0.4845/0.4631, x_norm_2: 0.6316/0.5903, x_norm_2@rebuilt_x_medium: 0.6648/0.5903
+[adahyc] layer 3: rebuild=['x_medium', 'x_norm_1', 'x_norm_2'] (plan) bits={'x': 2, 'x_norm_1': 2, 'q': 2, 'k': 2, 'v': 2, 'o': 2, 'x_medium': 2, 'x_norm_2': 2, 'gate': 2, 'up': 2} rel-err rebuild/store:
+[adahyc] layer 4: rebuild=['x_medium'] (tau=0.1) bits={'x': 2, 'x_norm_1': 2, 'q': 2, 'k': 2, 'v': 2, 'o': 2, 'x_medium': 2, 'x_norm_2': 2, 'gate': 4, 'up': 4} rel-err rebuild/store: x_norm_1: 0.8174/0.4846, x_medium: 0.0900/0.0927, x_norm_2: 0.7983/0.5823, x_norm_2@rebuilt_x_medium: 0.7784/0.5823
+[adahyc] layer 5: rebuild=['x_medium', 'x_norm_1', 'x_norm_2'] (plan) bits={'x': 2, 'x_norm_1': 2, 'q': 2, 'k': 2, 'v': 2, 'o': 2, 'x_medium': 2, 'x_norm_2': 2, 'gate': 2, 'up': 2} rel-err rebuild/store:
+[adahyc] layer 6: rebuild=['x_medium'] (tau=0.1) bits={'x': 2, 'x_norm_1': 2, 'q': 2, 'k': 2, 'v': 2, 'o': 2, 'x_medium': 2, 'x_norm_2': 2, 'gate': 4, 'up': 4} rel-err rebuild/store: x_norm_1: 0.7485/0.4716, x_medium: 0.1234/0.1257, x_norm_2: 0.7147/0.5754, x_norm_2@rebuilt_x_medium: 0.7106/0.5754
+[adahyc] layer 7: rebuild=['x_medium', 'x_norm_1', 'x_norm_2'] (plan) bits={'x': 2, 'x_norm_1': 2, 'q': 2, 'k': 2, 'v': 2, 'o': 2, 'x_medium': 2, 'x_norm_2': 2, 'gate': 2, 'up': 2} rel-err rebuild/store:
+[adahyc] layer 8: rebuild=['x_medium'] (tau=0.1) bits={'x': 2, 'x_norm_1': 2, 'q': 2, 'k': 2, 'v': 2, 'o': 2, 'x_medium': 2, 'x_norm_2': 2, 'gate': 4, 'up': 4} rel-err rebuild/store: x_norm_1: 0.7203/0.4792, x_medium: 0.1278/0.1299, x_norm_2: 0.8064/0.5671, x_norm_2@rebuilt_x_medium: 0.7946/0.5671
+[adahyc] layer 9: rebuild=['x_medium', 'x_norm_1', 'x_norm_2'] (plan) bits={'x': 2, 'x_norm_1': 2, 'q': 2, 'k': 2, 'v': 2, 'o': 2, 'x_medium': 2, 'x_norm_2': 2, 'gate': 2, 'up': 2} rel-err rebuild/store:
+[adahyc] layer 10: rebuild=['x_medium'] (tau=0.1) bits={'x': 2, 'x_norm_1': 2, 'q': 2, 'k': 2, 'v': 2, 'o': 2, 'x_medium': 2, 'x_norm_2': 2, 'gate': 4, 'up': 4} rel-err rebuild/store: x_norm_1: 0.7878/0.4900, x_medium: 0.1637/0.1687, x_norm_2: 0.7552/0.5601, x_norm_2@rebuilt_x_medium: 0.7353/0.5601
+[adahyc] layer 11: rebuild=['x_medium', 'x_norm_1', 'x_norm_2'] (plan) bits={'x': 2, 'x_norm_1': 2, 'q': 2, 'k': 2, 'v': 2, 'o': 2, 'x_medium': 2, 'x_norm_2': 2, 'gate': 2, 'up': 2} rel-err rebuild/store:
+[adahyc] layer 12: rebuild=['x_medium'] (tau=0.1) bits={'x': 2, 'x_norm_1': 2, 'q': 2, 'k': 2, 'v': 2, 'o': 2, 'x_medium': 2, 'x_norm_2': 2, 'gate': 4, 'up': 4} rel-err rebuild/store: x_norm_1: 0.7173/0.4835, x_medium: 0.1976/0.1982, x_norm_2: 0.7151/0.5509, x_norm_2@rebuilt_x_medium: 0.7126/0.5509
+[adahyc] layer 13: rebuild=['x_medium', 'x_norm_1', 'x_norm_2'] (plan) bits={'x': 2, 'x_norm_1': 2, 'q': 2, 'k': 2, 'v': 2, 'o': 2, 'x_medium': 2, 'x_norm_2': 2, 'gate': 2, 'up': 2} rel-err rebuild/store:
+[adahyc] layer 14: rebuild=['x_medium'] (tau=0.1) bits={'x': 2, 'x_norm_1': 2, 'q': 2, 'k': 2, 'v': 2, 'o': 2, 'x_medium': 2, 'x_norm_2': 2, 'gate': 4, 'up': 4} rel-err rebuild/store: x_norm_1: 0.6568/0.4931, x_medium: 0.2368/0.2350, x_norm_2: 0.6681/0.5555, x_norm_2@rebuilt_x_medium: 0.6784/0.5555
+[adahyc] layer 15: rebuild=['x_medium', 'x_norm_1', 'x_norm_2'] (plan) bits={'x': 2, 'x_norm_1': 2, 'q': 2, 'k': 2, 'v': 2, 'o': 2, 'x_medium': 2, 'x_norm_2': 2, 'gate': 2, 'up': 2} rel-err rebuild/store:
+[adahyc] layer 16: rebuild=['x_medium'] (tau=0.1) bits={'x': 2, 'x_norm_1': 2, 'q': 2, 'k': 2, 'v': 2, 'o': 2, 'x_medium': 2, 'x_norm_2': 2, 'gate': 4, 'up': 4} rel-err rebuild/store: x_norm_1: 0.6151/0.4981, x_medium: 0.2788/0.2817, x_norm_2: 0.6307/0.5546, x_norm_2@rebuilt_x_medium: 0.6229/0.5546
+[adahyc] layer 17: rebuild=['x_medium', 'x_norm_1', 'x_norm_2'] (plan) bits={'x': 2, 'x_norm_1': 2, 'q': 2, 'k': 2, 'v': 2, 'o': 2, 'x_medium': 2, 'x_norm_2': 2, 'gate': 2, 'up': 2} rel-err rebuild/store:
+[adahyc] layer 18: rebuild=['x_medium', 'x_norm_2'] (tau=0.1) bits={'x': 2, 'x_norm_1': 2, 'q': 2, 'k': 2, 'v': 2, 'o': 2, 'x_medium': 2, 'x_norm_2': 2, 'gate': 4, 'up': 4} rel-err rebuild/store: x_norm_1: 0.5709/0.5025, x_medium: 0.3421/0.3424, x_norm_2: 0.5968/0.5624, x_norm_2@rebuilt_x_medium: 0.5973/0.5624
+[adahyc] layer 19: rebuild=['x_medium', 'x_norm_1', 'x_norm_2'] (plan) bits={'x': 2, 'x_norm_1': 2, 'q': 2, 'k': 2, 'v': 2, 'o': 2, 'x_medium': 2, 'x_norm_2': 2, 'gate': 2, 'up': 2} rel-err rebuild/store:
+[adahyc] layer 20: rebuild=['x_medium', 'x_norm_2'] (tau=0.1) bits={'x': 2, 'x_norm_1': 2, 'q': 2, 'k': 2, 'v': 2, 'o': 2, 'x_medium': 2, 'x_norm_2': 2, 'gate': 4, 'up': 4} rel-err rebuild/store: x_norm_1: 0.5672/0.5070, x_medium: 0.4025/0.4102, x_norm_2: 0.5906/0.5632, x_norm_2@rebuilt_x_medium: 0.5779/0.5632
+[adahyc] layer 21: rebuild=['x_medium', 'x_norm_1', 'x_norm_2'] (plan) bits={'x': 2, 'x_norm_1': 2, 'q': 2, 'k': 2, 'v': 2, 'o': 2, 'x_medium': 2, 'x_norm_2': 2, 'gate': 2, 'up': 2} rel-err rebuild/store:
+[adahyc] average stored bits per buffered element: 2.1188
+adahyc q2 plan             cos 0.722788  rel_err 0.9363  |dloss| 0.0006  avg_bits 2.1188
+=== LoRA grads vs TRUE QLoRA (HF+PEFT), min/max over 2 held-out batches (B=4, S=256, calibrated on 5 other batches) ===
+variant                          cos
+fused baseline released     0.998685
+fused baseline hyc_fixes    0.999622
+intra_inter released q8     0.835889
+intra_inter hyc_fixes q8    0.971665
+intra_inter released q2     0.582353
+intra_inter hyc_fixes q2    0.586029
+released q8 dense-attn      0.855879
+hyc_fixes q8 dense-attn     0.990463
+adahyc q2 plan              0.722788
+[gpu] all checks passed

@@ -1,0 +1,25 @@
+all-2-bit HyC-LoRA baseline avg bits 2.0133 | budget 2.0133 | plan avg bits 2.0131
+predicted total sensitivity: plan 0.3376 vs HyC all-2-bit 0.8711
+layers rebuilding x_norm_1/x_medium/x_norm_2: 22/20/22 of 22
+layer  0: rebuild x_norm_1,x_medium,x_norm_2 upgraded -
+layer  1: rebuild x_norm_1,x_medium,x_norm_2 upgraded -
+layer  2: rebuild x_norm_1,x_medium,x_norm_2 upgraded -
+layer  3: rebuild x_norm_1,x_medium,x_norm_2 upgraded -
+layer  4: rebuild x_norm_1,x_medium,x_norm_2 upgraded -
+layer  5: rebuild x_norm_1,x_medium,x_norm_2 upgraded -
+layer  6: rebuild x_norm_1,x_medium,x_norm_2 upgraded {'q': 4, 'k': 4, 'v': 4}
+layer  7: rebuild x_norm_1,x_medium,x_norm_2 upgraded {'q': 4, 'k': 4, 'v': 4}
+layer  8: rebuild x_norm_1,x_medium,x_norm_2 upgraded {'q': 4, 'k': 4, 'v': 4}
+layer  9: rebuild x_norm_1,x_medium,x_norm_2 upgraded {'q': 4, 'k': 4, 'v': 4}
+layer 10: rebuild x_norm_1,x_medium,x_norm_2 upgraded {'q': 4, 'k': 4, 'v': 4}
+layer 11: rebuild x_norm_1,x_medium,x_norm_2 upgraded {'q': 4, 'k': 4, 'v': 4, 'gate': 4, 'up': 4}
+layer 12: rebuild x_norm_1,x_medium,x_norm_2 upgraded {'q': 4, 'k': 4, 'v': 4, 'gate': 4, 'up': 4}
+layer 13: rebuild x_norm_1,x_medium,x_norm_2 upgraded {'q': 4, 'k': 4, 'v': 4, 'gate': 4, 'up': 4}
+layer 14: rebuild x_norm_1,x_medium,x_norm_2 upgraded {'q': 4, 'k': 4, 'v': 4, 'gate': 4, 'up': 4}
+layer 15: rebuild x_norm_1,x_medium,x_norm_2 upgraded {'q': 4, 'k': 4, 'v': 4, 'gate': 4, 'up': 4}
+layer 16: rebuild x_norm_1,x_medium,x_norm_2 upgraded {'q': 4, 'k': 4, 'v': 4, 'gate': 4, 'up': 4}
+layer 17: rebuild x_norm_1,x_medium,x_norm_2 upgraded {'q': 4, 'k': 4, 'v': 4}
+layer 18: rebuild x_norm_1,x_medium,x_norm_2 upgraded {'q': 4, 'k': 4, 'v': 4}
+layer 19: rebuild x_norm_1,x_medium,x_norm_2 upgraded {'q': 4, 'k': 4, 'v': 4}
+layer 20: rebuild x_norm_1,x_norm_2          upgraded {'x_medium': 4, 'gate': 4, 'up': 4}
+layer 21: rebuild x_norm_1,x_norm_2          upgraded {'q': 4, 'k': 4, 'v': 4, 'x_medium': 4, 'gate': 4, 'up': 4}

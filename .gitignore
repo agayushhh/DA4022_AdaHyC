@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.aux
+*.log.tmp
+*.safetensors
+*.bin
+ckpt/
+runs/
+probe/rerun_*/
+external/HyC-LoRA-release/exp_results_da/*
+!external/HyC-LoRA-release/exp_results_da/.gitkeep

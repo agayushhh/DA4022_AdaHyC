@@ -1,0 +1,27 @@
+{
+ "peak_mem_gib": 6.4902873039245605,
+ "resumed_from": "exp_results_da/gsm8k-Llama-2-7b-adahyc-q2-fxT-fbT-zpT-pplan-t0.1-s11/checkpoint-1200",
+ "hyclora": {
+  "use_hyclora": true,
+  "layer_type": "adahyc",
+  "iteration_threshold": 5,
+  "softmax_outlier_ratio": 0.05,
+  "layernorm_outlier_ratio": 0.005,
+  "q_bit": 2,
+  "fix_outlier_bug": true,
+  "use_zero_point": true,
+  "bit_plan_path": "../../probe/out_llama2_7b/plan.json",
+  "rebuild_tau": 0.1,
+  "hyc_fixes": true
+ },
+ "seed": 11,
+ "train_runtime": 5935.3597,
+ "train_samples_per_second": 7.554,
+ "train_steps_per_second": 0.472,
+ "total_flos": 5.642474658846474e+17,
+ "train_loss": 0.08875125599260589,
+ "epoch": 5.997859818084537,
+ "gsm8k_acc_sampled": 0.3692191053828658,
+ "gsm8k_n": 1319,
+ "gsm8k_acc_greedy": 0.36770280515542075
+}
